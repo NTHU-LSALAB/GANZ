@@ -118,6 +118,56 @@ static __device__ void store_routing_context(struct inference_ring_slot *slot,
 	slot->tcp_recv_ack = BYTE_SWAP32(BYTE_SWAP32(hdr->l4_hdr.sent_seq) + client_data_len);
 }
 
+static __device__ int extract_post_body(const uint8_t *payload, uint32_t payload_len,
+                                        char *dst, uint32_t dst_offset, uint32_t dst_max)
+{
+	int content_length = -1;
+	int header_end = -1;
+
+	for (int i = 0; i < (int)payload_len - 3 && i < 2048; i++) {
+		if (content_length < 0 &&
+		    (payload[i] == 'C' || payload[i] == 'c') &&
+		    i + 16 < (int)payload_len) {
+			bool match = true;
+			const char *cl = "ontent-length: ";
+			for (int k = 0; k < 15 && match; k++) {
+				char c = payload[i + 1 + k];
+				if (c >= 'A' && c <= 'Z') c += 32;
+				char e = cl[k];
+				if (e >= 'A' && e <= 'Z') e += 32;
+				if (c != e) match = false;
+			}
+			if (match) {
+				content_length = 0;
+				for (int j = i + 16; j < (int)payload_len && payload[j] >= '0' && payload[j] <= '9'; j++)
+					content_length = content_length * 10 + (payload[j] - '0');
+			}
+		}
+
+		if (payload[i] == '\r' && payload[i+1] == '\n' &&
+		    payload[i+2] == '\r' && payload[i+3] == '\n') {
+			header_end = i + 4;
+			break;
+		}
+	}
+
+	if (header_end < 0 || content_length <= 0)
+		return 0;
+
+	int avail = (int)payload_len - header_end;
+	int copy_len = content_length < avail ? content_length : avail;
+	if ((uint32_t)(dst_offset + copy_len) >= dst_max)
+		copy_len = dst_max - dst_offset - 1;
+	if (copy_len <= 0)
+		return 0;
+
+	for (int i = 0; i < copy_len; i++)
+		dst[dst_offset + i] = (char)payload[header_end + i];
+	dst[dst_offset + copy_len] = '\0';
+
+	return copy_len;
+}
+
 static __device__ void publish_slot(struct inference_ring_buffer *ring, int slot_idx)
 {
 	struct inference_ring_slot *slot = &ring->slots[slot_idx];
@@ -331,8 +381,37 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			}
 			else if (filter_is_http_head(payload))
 				stats_thread.http_head++;
-			else if (filter_is_http_post(payload))
+			else if (filter_is_http_post(payload)) {
+				if (http_server && g_inference_ring_buf != nullptr) {
+					uint16_t ip_total_len = BYTE_SWAP16(hdr->l3_hdr.total_length);
+					uint32_t tcp_hdr_len = (hdr->l4_hdr.dt_off >> 4) * 4;
+					uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_hdr_len;
+
+					uint64_t request_id = 0;
+					int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
+					if (slot_idx >= 0) {
+						struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
+						slot->t0_gpu_received = clock64();
+						store_routing_context(slot, hdr);
+						slot->http_page_type = (uint8_t)HTTP_GET_INFERENCE;
+						slot->len = 0;
+						slot->record_count = 0;
+
+						int blen = extract_post_body(payload, payload_len,
+						                             slot->data, 0, sizeof(slot->data) - 1);
+						if (blen > 0) {
+							slot->len = blen;
+							slot->record_count = 1;
+							slot->directory[0].offset = 0;
+							slot->directory[0].length = blen;
+							publish_slot(g_inference_ring_buf, slot_idx);
+						} else {
+							release_slot(g_inference_ring_buf, slot_idx);
+						}
+					}
+				}
 				stats_thread.http_post++;
+			}
 			else if (filter_is_http(payload))
 				stats_thread.http++;
 			else if(filter_is_tcp_fin(&(hdr->l4_hdr)))
