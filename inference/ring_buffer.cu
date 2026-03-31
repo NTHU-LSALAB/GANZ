@@ -269,6 +269,8 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
     slot->record_count = 1;
     slot->directory[0].offset = 0;
     slot->directory[0].length = len;
+    slot->directory[0].tcp_sent_seq = slot->tcp_sent_seq;
+    slot->directory[0].tcp_recv_ack = slot->tcp_recv_ack;
 
     __atomic_store_n(&slot->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
 
@@ -317,6 +319,8 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
     for (int i = 0; i < MAX_RECORDS_PER_SLOT; i++) {
         slot->directory[i].offset = 0;
         slot->directory[i].length = 0;
+        slot->directory[i].tcp_sent_seq = 0;
+        slot->directory[i].tcp_recv_ack = 0;
     }
     slot->t1_slot_allocated = clock64();
 

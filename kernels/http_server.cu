@@ -241,44 +241,88 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 					break;
 				}
 
-				/* Generate JSON response for inference requests */
 				if (page_type == HTTP_GET_INFERENCE) {
-					char *response_buf = (char *)(buf_addr + base_pkt_len);
+					uint32_t nrec = current_slot->record_count;
+					if (nrec == 0) nrec = 1;
 
-					int body_len = 0;
-					int header_len = 0;
+					for (uint32_t rec = 0; rec < nrec; rec++) {
+						uint32_t rec_off = current_slot->directory[rec].offset;
+						uint32_t rec_len = current_slot->directory[rec].length;
+						if (rec_len == 0 && rec == 0) rec_len = current_slot->len;
 
-					if (lane_id == 0) {
-						current_slot->t8_gpu_sent = clock64();
-
-						header_len = HTTP_RESP_PREFIX_LEN;
-						body_len = (int)current_slot->len;
-						if (body_len <= 0 || body_len > HTTP_BODY_MAX_LEN) {
-							const char err[] = "{\"error\":\"no result\"}";
-							body_len = sizeof(err) - 1;
-							header_len += int_to_str(response_buf + header_len, body_len);
-							int body_off = header_len + HTTP_RESP_SUFFIX_LEN;
-							for (int k = 0; k < body_len; k++)
-								response_buf[body_off + k] = err[k];
-						} else {
-							header_len += int_to_str(response_buf + header_len, body_len);
+						if (rec > 0) {
+							if (lane_id == 0)
+								doca_gpu_buf_idx = atomicAdd(&g_tx_buf_counter, 1ULL) % TX_BUF_NUM;
+							doca_gpu_buf_idx = __shfl_sync(0xffffffff, doca_gpu_buf_idx, 0);
+							ret = doca_gpu_dev_buf_get_buf(buf_arr_gpu_page_index, doca_gpu_buf_idx, &buf);
+							if (ret != DOCA_SUCCESS) break;
+							ret = doca_gpu_dev_buf_get_addr(buf, &buf_addr);
+							if (ret != DOCA_SUCCESS) break;
 						}
-						nbytes_page = header_len + HTTP_RESP_SUFFIX_LEN + body_len;
+
+						char *response_buf = (char *)(buf_addr + base_pkt_len);
+						int body_len = 0;
+						int header_len = 0;
+
+						if (lane_id == 0) {
+							if (rec == 0) current_slot->t8_gpu_sent = clock64();
+							header_len = HTTP_RESP_PREFIX_LEN;
+							body_len = (int)rec_len;
+							if (body_len <= 0 || body_len > HTTP_BODY_MAX_LEN) {
+								const char err[] = "{\"error\":\"no result\"}";
+								body_len = sizeof(err) - 1;
+								header_len += int_to_str(response_buf + header_len, body_len);
+								int bo = header_len + HTTP_RESP_SUFFIX_LEN;
+								for (int k = 0; k < body_len; k++)
+									response_buf[bo + k] = err[k];
+							} else {
+								header_len += int_to_str(response_buf + header_len, body_len);
+							}
+							nbytes_page = header_len + HTTP_RESP_SUFFIX_LEN + body_len;
+						}
+
+						header_len = __shfl_sync(0xffffffff, header_len, 0);
+						body_len = __shfl_sync(0xffffffff, body_len, 0);
+						nbytes_page = __shfl_sync(0xffffffff, nbytes_page, 0);
+
+						warp_memcpy(response_buf, HTTP_RESP_PREFIX, HTTP_RESP_PREFIX_LEN, lane_id);
+						__syncwarp();
+						warp_memcpy(response_buf + header_len, HTTP_RESP_SUFFIX, HTTP_RESP_SUFFIX_LEN, lane_id);
+						int bo = header_len + HTTP_RESP_SUFFIX_LEN;
+						warp_memcpy(response_buf + bo, current_slot->data + rec_off, body_len, lane_id);
+
+						raw_to_tcp(buf_addr, &hdr, &payload);
+						http_set_mac_addr(hdr, (uint16_t *)current_slot->eth_src_addr_bytes, (uint16_t *)current_slot->eth_dst_addr_bytes);
+						hdr->l3_hdr.src_addr = current_slot->ip_src_addr;
+						hdr->l3_hdr.dst_addr = current_slot->ip_dst_addr;
+						hdr->l4_hdr.src_port = current_slot->tcp_src_port;
+						hdr->l4_hdr.dst_port = current_slot->tcp_dst_port;
+						uint32_t rec_seq = current_slot->directory[rec].tcp_sent_seq;
+						uint32_t rec_ack = current_slot->directory[rec].tcp_recv_ack;
+						if (rec_seq == 0 && rec == 0) rec_seq = current_slot->tcp_sent_seq;
+						if (rec_ack == 0 && rec == 0) rec_ack = current_slot->tcp_recv_ack;
+						hdr->l4_hdr.sent_seq = rec_seq;
+						hdr->l4_hdr.recv_ack = rec_ack;
+
+						hdr->l4_hdr.tcp_flags = TCP_FLAG_ACK | TCP_FLAG_PSH;
+						hdr->l4_hdr.cksum = 0;
+						hdr->l3_hdr.total_length = BYTE_SWAP16(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + nbytes_page);
+						hdr->l3_hdr.hdr_checksum = 0;
+
+						ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
+						if (ret != DOCA_SUCCESS) break;
+						send_pkts++;
+
+						if (rec + 1 < nrec) {
+							if (lane_id == 0) {
+								doca_gpu_dev_eth_txq_commit_strong(txq);
+								doca_gpu_dev_eth_txq_push(txq);
+							}
+							__syncwarp();
+						}
 					}
-
-					header_len = __shfl_sync(0xffffffff, header_len, 0);
-					body_len = __shfl_sync(0xffffffff, body_len, 0);
-					nbytes_page = __shfl_sync(0xffffffff, nbytes_page, 0);
-
-					warp_memcpy(response_buf, HTTP_RESP_PREFIX, HTTP_RESP_PREFIX_LEN, lane_id);
-					__syncwarp();
-					warp_memcpy(response_buf + header_len, HTTP_RESP_SUFFIX, HTTP_RESP_SUFFIX_LEN, lane_id);
-					int body_off = header_len + HTTP_RESP_SUFFIX_LEN;
-					warp_memcpy(response_buf + body_off, current_slot->data, body_len, lane_id);
-				}
-
+				} else {
 				raw_to_tcp(buf_addr, &hdr, &payload);
-				/* Direct copy: RX kernel already pre-swapped src↔dst */
 				http_set_mac_addr(hdr, (uint16_t *)current_slot->eth_src_addr_bytes, (uint16_t *)current_slot->eth_dst_addr_bytes);
 				hdr->l3_hdr.src_addr = current_slot->ip_src_addr;
 				hdr->l3_hdr.dst_addr = current_slot->ip_dst_addr;
@@ -287,12 +331,10 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				hdr->l4_hdr.sent_seq = current_slot->tcp_sent_seq;
 				hdr->l4_hdr.recv_ack = current_slot->tcp_recv_ack;
 				
-				/* Keep-Alive: ACK + PSH without FIN */
 				hdr->l4_hdr.tcp_flags = TCP_FLAG_ACK | TCP_FLAG_PSH;
 				hdr->l4_hdr.cksum = 0;
-
 				hdr->l3_hdr.total_length = BYTE_SWAP16(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + nbytes_page);
-				hdr->l3_hdr.hdr_checksum = 0;  /* Hardware computes checksum */
+				hdr->l3_hdr.hdr_checksum = 0;
 
 				ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
 				if (ret != DOCA_SUCCESS) {
@@ -300,8 +342,9 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 					DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
 					break;
 				}
+				send_pkts++;
+				}
 
-				/* Release slot: store FREE then return to free_pool for O(1) reuse */
 				{
 					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
 						ready_ref(*(uint32_t*)&current_slot->ready);
@@ -309,8 +352,6 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				}
 				if (lane_id == 0)
 					gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
-
-				send_pkts++;
 			}
 		}
 		__syncwarp();

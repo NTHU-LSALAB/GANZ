@@ -120,6 +120,7 @@ static uint64_t g_collect_count = 0;
 
 static int collect_ready_slots(struct inference_ring_buffer *ring,
                                uint32_t *batch_slots,
+                               uint32_t *batch_record_idx,
                                const char **batch_texts,
                                int max_batch) {
 	if (__atomic_load_n(&ring->pending_count, __ATOMIC_ACQUIRE) == 0)
@@ -149,6 +150,7 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 				url_decode(slot->data);
 				if (strlen(slot->data) > 512) slot->data[512] = '\0';
 				batch_slots[count] = (uint32_t)idx;
+				batch_record_idx[count] = 0;
 				batch_texts[count] = slot->data;
 				slot->t3_cpu_read = get_timestamp_ns();
 				count++;
@@ -190,17 +192,27 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 			continue;
 		}
 
-		slot->data[data_len] = '\0';
-
-		if (data_len > 512)
-			slot->data[512] = '\0';
-
-		batch_slots[count] = (uint32_t)idx;
-		batch_texts[count] = slot->data;
-
 		slot->t3_cpu_read = get_timestamp_ns();
 
-		count++;
+		uint32_t nrec = slot->record_count;
+		if (nrec == 0) nrec = 1;
+
+		for (uint32_t r = 0; r < nrec && count < max_batch; r++) {
+			uint32_t off = slot->directory[r].offset;
+			uint32_t rlen = slot->directory[r].length;
+			if (rlen == 0 && r == 0) {
+				rlen = data_len;
+				off = 0;
+			}
+			if (off + rlen > sizeof(slot->data)) continue;
+			slot->data[off + rlen] = '\0';
+			if (rlen > 512) slot->data[off + 512] = '\0';
+
+			batch_slots[count] = (uint32_t)idx;
+			batch_record_idx[count] = r;
+			batch_texts[count] = slot->data + off;
+			count++;
+		}
 	}
 
 	uint64_t elapsed = get_timestamp_ns() - t_start;
@@ -236,6 +248,7 @@ void* simple_inference_reader(void* arg) {
 	DOCA_LOG_INFO("[ADAPTIVE] Thread %d: Using GPU %d for TensorRT", thread_id, g_cuda_id);
 
 	uint32_t batch_slots[BATCH_MAX_SIZE];
+	uint32_t batch_record_idx[BATCH_MAX_SIZE];
 	const char *batch_texts[BATCH_MAX_SIZE];
 	float batch_embeddings[BATCH_MAX_SIZE * MAX_EMBEDDING_DIM];
 	int batch_token_counts[BATCH_MAX_SIZE];
@@ -264,7 +277,7 @@ void* simple_inference_reader(void* arg) {
 		}
 
 		int batch_size = collect_ready_slots(g_inference_ring_buf, batch_slots,
-		                                      batch_texts, BATCH_MAX_SIZE);
+		                                      batch_record_idx, batch_texts, BATCH_MAX_SIZE);
 
 		if (batch_size == 0) {
 			for (int spin = 0; spin < 2000; spin++) {
@@ -284,6 +297,7 @@ void* simple_inference_reader(void* arg) {
 				usleep(100);
 				int more = collect_ready_slots(g_inference_ring_buf,
 				                               &batch_slots[batch_size],
+				                               &batch_record_idx[batch_size],
 				                               &batch_texts[batch_size],
 				                               target - batch_size);
 				if (more > 0) batch_size += more;
@@ -306,10 +320,11 @@ void* simple_inference_reader(void* arg) {
 					while (get_timestamp_ns() < spin_until)
 						__asm__ __volatile__("pause" ::: "memory");
 
-					int more = collect_ready_slots(g_inference_ring_buf,
-					                               &batch_slots[batch_size],
-					                               &batch_texts[batch_size],
-					                               BATCH_MAX_SIZE - batch_size);
+				int more = collect_ready_slots(g_inference_ring_buf,
+				                               &batch_slots[batch_size],
+				                               &batch_record_idx[batch_size],
+				                               &batch_texts[batch_size],
+				                               BATCH_MAX_SIZE - batch_size);
 					if (more == 0)
 						break;
 					batch_size += more;
@@ -450,19 +465,31 @@ void* simple_inference_reader(void* arg) {
 
 			for (int i = 0; i < batch_size; i++) {
 				uint32_t slot_idx = batch_slots[i];
+				uint32_t rec = batch_record_idx[i];
 				float *emb = &batch_embeddings[i * MAX_EMBEDDING_DIM];
 				int tokens = batch_token_counts[i];
+				struct inference_ring_slot *s = &g_inference_ring_buf->slots[slot_idx];
 
-				snprintf(result_buffer, sizeof(result_buffer),
+				int rlen = snprintf(result_buffer, sizeof(result_buffer),
 					"{\"input\":\"%s\",\"tokens\":%d,\"embedding_sample\":[%.6f,%.6f,%.6f],\"inference_time_us\":%ld,\"batch_size\":%d}",
 					batch_texts[i], tokens,
 					emb[0], emb[1], emb[2],
 					elapsed_us, batch_size);
 
-				g_inference_ring_buf->slots[slot_idx].t6_cpu_wrote_uvm = get_timestamp_ns();
+				uint32_t off = s->directory[rec].offset;
+				uint32_t max_len = sizeof(s->data) - off - 1;
+				if ((uint32_t)rlen > max_len) rlen = max_len;
+				memcpy(s->data + off, result_buffer, rlen);
+				s->data[off + rlen] = '\0';
+				s->directory[rec].length = rlen;
 
-				if (!cpu_write_inference_result_to_gpu_ring(g_inference_ring_buf, slot_idx, result_buffer))
-					DOCA_LOG_ERR("[ADAPTIVE] Failed write slot %u", slot_idx);
+				bool is_last_record = (i + 1 >= batch_size || batch_slots[i + 1] != slot_idx);
+				if (is_last_record) {
+					s->len = off + rlen;
+					s->t6_cpu_wrote_uvm = get_timestamp_ns();
+					__atomic_store_n(&s->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
+					cpu_iq_push(&g_inference_ring_buf->response_queue, (int)slot_idx);
+				}
 			}
 		} else {
 			DOCA_LOG_WARN("[ADAPTIVE] TensorRT not loaded, fallback");

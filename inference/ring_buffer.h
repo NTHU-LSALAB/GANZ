@@ -27,11 +27,13 @@
 /*
  * Record Directory entry — describes one request within a packed slot
  */
-#define MAX_RECORDS_PER_SLOT 8
+#define MAX_RECORDS_PER_SLOT 4
 
 struct record_entry {
-    uint32_t offset;    /* byte offset within data[] buffer */
-    uint32_t length;    /* byte length of this record's payload */
+    uint32_t offset;
+    uint32_t length;
+    uint32_t tcp_sent_seq;
+    uint32_t tcp_recv_ack;
 };
 
 /*

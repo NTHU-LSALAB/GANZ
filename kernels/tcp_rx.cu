@@ -324,6 +324,8 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 								slot->record_count = 1;
 								slot->directory[0].offset = 0;
 								slot->directory[0].length = plen;
+								slot->directory[0].tcp_sent_seq = slot->tcp_sent_seq;
+								slot->directory[0].tcp_recv_ack = slot->tcp_recv_ack;
 
 								if (!g_enable_packing) {
 									publish_slot(g_inference_ring_buf, slot_idx);
@@ -370,6 +372,8 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 							slot->record_count = 1;
 							slot->directory[0].offset = 0;
 							slot->directory[0].length = blen;
+							slot->directory[0].tcp_sent_seq = slot->tcp_sent_seq;
+							slot->directory[0].tcp_recv_ack = slot->tcp_recv_ack;
 							publish_slot(g_inference_ring_buf, slot_idx);
 						} else {
 							release_slot(g_inference_ring_buf, slot_idx);
@@ -420,6 +424,8 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 						uint32_t rec = bs->record_count;
 						bs->directory[rec].offset = dst_off;
 						bs->directory[rec].length = src_len;
+						bs->directory[rec].tcp_sent_seq = src->tcp_sent_seq;
+						bs->directory[rec].tcp_recv_ack = src->tcp_recv_ack;
 						bs->record_count = rec + 1;
 						bs->len = dst_off + src_len + 1;
 						release_slot(g_inference_ring_buf, pending_slots[j]);

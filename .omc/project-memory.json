@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1774443716153,
+  "projectRoot": "/home/dpu/GAZSI",
+  "techStack": {
+    "languages": [
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "make build",
+    "testCommand": "make test",
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "bak": {
+      "path": "bak",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1774443716136,
+      "keyFiles": [
+        "echo-mode-analysis.md",
+        "generate_paper_figures.py",
+        "literature-synthesis.md",
+        "percentile-data-analysis.md",
+        "plot_algorithm_comparison.py"
+      ]
+    },
+    "baseline": {
+      "path": "baseline",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1774443716138,
+      "keyFiles": [
+        "baseline_trt",
+        "baseline_trt.cpp",
+        "server.py"
+      ]
+    },
+    "benchmark_results": {
+      "path": "benchmark_results",
+      "purpose": null,
+      "fileCount": 189,
+      "lastAccessed": 1774443716143,
+      "keyFiles": [
+        "baseline_bert_base_c1.txt",
+        "baseline_bert_base_c16.txt",
+        "baseline_bert_base_c16_new.txt",
+        "baseline_bert_base_c16_run1.txt",
+        "baseline_bert_base_c16_run2.txt"
+      ]
+    },
+    "dependencies": {
+      "path": "dependencies",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1774443716144,
+      "keyFiles": [
+        "meson.build"
+      ]
+    },
+    "doca": {
+      "path": "doca",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1774443716144,
+      "keyFiles": [
+        "args.c",
+        "common.h",
+        "defines.h",
+        "device.c",
+        "flow.c"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 13,
+      "lastAccessed": 1774443716144,
+      "keyFiles": [
+        "GAZSI-algorithms-detail.drawio",
+        "GAZSI-architecture.md",
+        "GAZSI-system-architecture.drawio",
+        "audit-results.md",
+        "ch4-experiment-plan.md"
+      ]
+    },
+    "inference": {
+      "path": "inference",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1774443716145,
+      "keyFiles": [
+        "ring_buffer.cu",
+        "ring_buffer.h",
+        "tensorrt.cu",
+        "tensorrt.h"
+      ]
+    },
+    "kernels": {
+      "path": "kernels",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1774443716145,
+      "keyFiles": [
+        "filters.cuh",
+        "http_server.cu",
+        "tcp_rx.cu"
+      ]
+    },
+    "models": {
+      "path": "models",
+      "purpose": "Data models",
+      "fileCount": 740,
+      "lastAccessed": 1774443716148,
+      "keyFiles": [
+        "Constant_3940_attr__value",
+        "bert_base.engine",
+        "bert_base.onnx",
+        "create_engines.py",
+        "export_open_llama.py"
+      ]
+    },
+    "tcp": {
+      "path": "tcp",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1774443716149,
+      "keyFiles": [
+        "cpu_rss.c",
+        "cpu_rss.h",
+        "session.c",
+        "session.h"
+      ]
+    },
+    "tools": {
+      "path": "tools",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1774443716149,
+      "keyFiles": [
+        "bench_single.sh",
+        "benchmark_batch.sh",
+        "benchmark_c0.cu",
+        "benchmark_q2q3.sh",
+        "plot_q1_results.py"
+      ]
+    },
+    "utils": {
+      "path": "utils",
+      "purpose": "Utility functions",
+      "fileCount": 2,
+      "lastAccessed": 1774443716149,
+      "keyFiles": [
+        "utils.c",
+        "utils.h"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
