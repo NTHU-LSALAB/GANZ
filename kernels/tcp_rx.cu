@@ -18,9 +18,10 @@
 
 DOCA_LOG_REGISTER(GPUNET::KernelReceiveTcp);
 
-/* Global ring buffer and semaphore pointers (extern from http_server.cu) */
 extern __device__ struct inference_ring_buffer *g_inference_ring_buf;
 extern __device__ struct doca_gpu_semaphore_gpu *g_sem_request_gpu;
+
+__device__ int g_enable_packing = 0;
 
 static
 __device__ enum http_page_get get_http_page_type(const uint8_t *payload)
@@ -43,6 +44,102 @@ __device__ enum http_page_get get_http_page_type(const uint8_t *payload)
 }
 
 
+static __device__ uint32_t conn_hash_from_hdr(const struct eth_ip_tcp_hdr *hdr)
+{
+	uint32_t h = hdr->l3_hdr.src_addr ^ hdr->l3_hdr.dst_addr;
+	h ^= (uint32_t)hdr->l4_hdr.src_port << 16 | (uint32_t)hdr->l4_hdr.dst_port;
+	h ^= (h >> 16);
+	return h;
+}
+
+static __device__ int extract_url_param(const uint8_t *payload, uint32_t payload_len,
+                                         char *dst, uint32_t dst_offset, uint32_t dst_max)
+{
+	int param_start = -1;
+	if (payload_len > 18 &&
+	    payload[15] == '?' && payload[16] == 'd' && payload[17] == '=') {
+		param_start = 18;
+	} else {
+		for (int i = 5; i < (int)payload_len && i < 1024; i++) {
+			if (payload[i] == '?' && payload[i+1] == 'd' && payload[i+2] == '=') {
+				param_start = i + 3;
+				break;
+			}
+		}
+	}
+	if (param_start < 0)
+		return 0;
+
+	int len = 0;
+	int limit = payload_len < (uint32_t)(param_start + 511) ? payload_len : (param_start + 511);
+	for (int j = param_start; j < limit && (dst_offset + len) < dst_max; j++) {
+		uint8_t c = payload[j];
+		if (c == ' ' || c == '&' || c == '\r' || c == '\n')
+			break;
+		if (c == '+') {
+			dst[dst_offset + len++] = ' ';
+		} else if (c == '%' && j + 2 < limit) {
+			uint8_t hi = payload[j+1], lo = payload[j+2];
+			uint8_t h = (hi >= '0' && hi <= '9') ? hi - '0' :
+			            (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 :
+			            (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : 0;
+			uint8_t l = (lo >= '0' && lo <= '9') ? lo - '0' :
+			            (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 :
+			            (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : 0;
+			dst[dst_offset + len++] = (char)((h << 4) | l);
+			j += 2;
+		} else {
+			dst[dst_offset + len++] = (char)c;
+		}
+	}
+	dst[dst_offset + len] = '\0';
+	return len;
+}
+
+static __device__ void store_routing_context(struct inference_ring_slot *slot,
+                                              const struct eth_ip_tcp_hdr *hdr)
+{
+	((uint16_t *)slot->eth_src_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[0];
+	((uint16_t *)slot->eth_src_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[1];
+	((uint16_t *)slot->eth_src_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[2];
+	((uint16_t *)slot->eth_dst_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[0];
+	((uint16_t *)slot->eth_dst_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[1];
+	((uint16_t *)slot->eth_dst_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[2];
+	slot->ip_src_addr = hdr->l3_hdr.dst_addr;
+	slot->ip_dst_addr = hdr->l3_hdr.src_addr;
+	slot->ip_total_length = hdr->l3_hdr.total_length;
+	slot->tcp_src_port = hdr->l4_hdr.dst_port;
+	slot->tcp_dst_port = hdr->l4_hdr.src_port;
+	slot->tcp_dt_off = hdr->l4_hdr.dt_off;
+
+	uint32_t client_data_len = BYTE_SWAP16(hdr->l3_hdr.total_length)
+	                         - sizeof(struct ipv4_hdr) - ((hdr->l4_hdr.dt_off >> 4) * 4);
+	slot->tcp_sent_seq = hdr->l4_hdr.recv_ack;
+	slot->tcp_recv_ack = BYTE_SWAP32(BYTE_SWAP32(hdr->l4_hdr.sent_seq) + client_data_len);
+}
+
+static __device__ void publish_slot(struct inference_ring_buffer *ring, int slot_idx)
+{
+	struct inference_ring_slot *slot = &ring->slots[slot_idx];
+	cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+		pending_ref(*(uint32_t*)&ring->pending_count);
+	cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+		ready_ref(*(uint32_t*)&slot->ready);
+
+	pending_ref.fetch_add(1, cuda::memory_order_release);
+	ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
+	gpu_iq_push(&ring->request_queue, slot_idx);
+}
+
+static __device__ void release_slot(struct inference_ring_buffer *ring, int slot_idx)
+{
+	struct inference_ring_slot *slot = &ring->slots[slot_idx];
+	cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+		ready_ref(*(uint32_t*)&slot->ready);
+	ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
+	gpu_iq_push(&ring->free_pool, slot_idx);
+}
+
 __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 					struct doca_gpu_eth_rxq *rxq0, struct doca_gpu_eth_rxq *rxq1, struct doca_gpu_eth_rxq *rxq2, struct doca_gpu_eth_rxq *rxq3,
 					int sem_num,
@@ -53,6 +150,11 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 	__shared__ uint32_t rx_pkt_num;
 	__shared__ uint64_t rx_buf_idx;
 	__shared__ struct stats_tcp stats_sh;
+
+	/* Packing state: per-block shared slot for multi-record packing */
+	__shared__ int packing_slot_idx;
+	__shared__ uint32_t packing_conn_hash;
+	__shared__ uint32_t packing_data_offset;
 
 	doca_error_t ret;
 	struct doca_gpu_eth_rxq *rxq = NULL;
@@ -97,6 +199,9 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 		DOCA_GPUNETIO_VOLATILE(stats_sh.tcp_fin) = 0;
 		DOCA_GPUNETIO_VOLATILE(stats_sh.tcp_ack) = 0;
 		DOCA_GPUNETIO_VOLATILE(stats_sh.others) = 0;
+		packing_slot_idx = -1;
+		packing_conn_hash = 0;
+		packing_data_offset = 0;
 	}
 	__syncthreads();
 
@@ -146,115 +251,82 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 
 			raw_to_tcp(buf_addr, &hdr, &payload);
 
-			/* Priority to GET for the HTTP server mode */
 			bool is_http_get = filter_is_http_get(payload);
 			if (is_http_get) {
 				if (http_server && g_inference_ring_buf != nullptr) {
-					uint64_t request_id = 0;
-					int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
+					uint16_t ip_total_len = BYTE_SWAP16(hdr->l3_hdr.total_length);
+					uint32_t tcp_hdr_len = (hdr->l4_hdr.dt_off >> 4) * 4;
+					uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_hdr_len;
+					enum http_page_get page_type = get_http_page_type(payload);
 
-					if (slot_idx >= 0) {
-						struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
-
-							/* T0: HTTP request received */
+					if (!g_enable_packing) {
+						/* === Parallel path (default): one slot per request === */
+						uint64_t request_id = 0;
+						int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
+						if (slot_idx >= 0) {
+							struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
 							slot->t0_gpu_received = clock64();
-
-							/* Pre-swap TCP info: store as response-ready (src↔dst swapped) */
-							((uint16_t *)slot->eth_src_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[0];
-							((uint16_t *)slot->eth_src_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[1];
-							((uint16_t *)slot->eth_src_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.d_addr_bytes)[2];
-							((uint16_t *)slot->eth_dst_addr_bytes)[0] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[0];
-							((uint16_t *)slot->eth_dst_addr_bytes)[1] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[1];
-							((uint16_t *)slot->eth_dst_addr_bytes)[2] = ((uint16_t *)hdr->l2_hdr.s_addr_bytes)[2];
-							slot->ip_src_addr = hdr->l3_hdr.dst_addr;
-							slot->ip_dst_addr = hdr->l3_hdr.src_addr;
-							slot->ip_total_length = hdr->l3_hdr.total_length;
-							slot->tcp_src_port = hdr->l4_hdr.dst_port;
-							slot->tcp_dst_port = hdr->l4_hdr.src_port;
-							slot->tcp_dt_off = hdr->l4_hdr.dt_off;
-
-							uint32_t client_data_len = BYTE_SWAP16(hdr->l3_hdr.total_length)
-							                         - sizeof(struct ipv4_hdr) - ((hdr->l4_hdr.dt_off >> 4) * 4);
-							slot->tcp_sent_seq = hdr->l4_hdr.recv_ack;
-							slot->tcp_recv_ack = BYTE_SWAP32(BYTE_SWAP32(hdr->l4_hdr.sent_seq) + client_data_len);
-
-							slot->http_page_type = (uint8_t)get_http_page_type(payload);
-
-							/* Calculate TCP payload length */
-							uint16_t ip_total_len = BYTE_SWAP16(hdr->l3_hdr.total_length);
-							uint32_t tcp_header_len = (hdr->l4_hdr.dt_off >> 4) * 4;
-							uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_header_len;
-
+							store_routing_context(slot, hdr);
+							slot->http_page_type = (uint8_t)page_type;
 							slot->len = 0;
-						slot->record_count = 0;
-						slot->data[0] = '\0';
+							slot->record_count = 0;
 
-						/* Fast path: /inference?d= has "?d=" at known offset */
-							int param_start = -1;
-							if (payload_len > 18 &&
-							    payload[15] == '?' && payload[16] == 'd' && payload[17] == '=') {
-								param_start = 18;
+							int plen = extract_url_param(payload, payload_len,
+							                             slot->data, 0, sizeof(slot->data) - 1);
+							if (plen > 0) {
+								slot->len = plen;
+								slot->record_count = 1;
+								slot->directory[0].offset = 0;
+								slot->directory[0].length = plen;
+								publish_slot(g_inference_ring_buf, slot_idx);
 							} else {
-								for (int i = 5; i < (int)payload_len && i < 1024; i++) {
-									if (payload[i] == '?' && payload[i+1] == 'd' && payload[i+2] == '=') {
-										param_start = i + 3;
-										break;
-									}
-								}
+								release_slot(g_inference_ring_buf, slot_idx);
 							}
-
-							if (param_start >= 0) {
-								int param_len = 0;
-								int max_search = payload_len < (uint32_t)(param_start + 511) ? payload_len : (param_start + 511);
-								for (int j = param_start; j < max_search; j++) {
-									uint8_t c = payload[j];
-									if (c == ' ' || c == '&' || c == '\r' || c == '\n')
-										break;
-									if (c == '+') {
-										slot->data[param_len++] = ' ';
-									} else if (c == '%' && j + 2 < max_search) {
-										uint8_t hi = payload[j+1], lo = payload[j+2];
-										uint8_t h = (hi >= '0' && hi <= '9') ? hi - '0' :
-										            (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 :
-										            (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : 0;
-										uint8_t l = (lo >= '0' && lo <= '9') ? lo - '0' :
-										            (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 :
-										            (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : 0;
-										slot->data[param_len++] = (char)((h << 4) | l);
-										j += 2;
-									} else {
-										slot->data[param_len++] = (char)c;
-									}
-								}
-								slot->data[param_len] = '\0';
-								slot->len = param_len;
-							}
-
-				/* Only set PARAM_READY if valid parameter was extracted */
-			if (slot->len > 0) {
-					slot->record_count = 1;
-					slot->directory[0].offset = 0;
-					slot->directory[0].length = slot->len;
-					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
-						pending_ref(*(uint32_t*)&g_inference_ring_buf->pending_count);
-					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
-						ready_ref(*(uint32_t*)&slot->ready);
-
-					pending_ref.fetch_add(1, cuda::memory_order_release);
-					ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
-
-					/* Q2: push to request_queue for O(1) CPU pickup */
-					gpu_iq_push(&g_inference_ring_buf->request_queue, slot_idx);
-					} else {
-						cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
-							ready_ref(*(uint32_t*)&slot->ready);
-						ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
-						/* Return unused slot to free_pool */
-						gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
-					}
 						}
-				}
+					} else if (threadIdx.x == 0) {
+						/* === Packing path (thread-0 serial): multi-record slots === */
+						uint32_t ch = conn_hash_from_hdr(hdr);
+						bool need_new_slot = (packing_slot_idx < 0)
+						    || (ch != packing_conn_hash)
+						    || (g_inference_ring_buf->slots[packing_slot_idx].record_count >= MAX_RECORDS_PER_SLOT)
+						    || (packing_data_offset + 512 > sizeof(g_inference_ring_buf->slots[0].data));
 
+						if (need_new_slot) {
+							if (packing_slot_idx >= 0 && g_inference_ring_buf->slots[packing_slot_idx].record_count > 0)
+								publish_slot(g_inference_ring_buf, packing_slot_idx);
+							else if (packing_slot_idx >= 0)
+								release_slot(g_inference_ring_buf, packing_slot_idx);
+
+							uint64_t rid = 0;
+							packing_slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &rid);
+							packing_conn_hash = ch;
+							packing_data_offset = 0;
+							if (packing_slot_idx >= 0) {
+								struct inference_ring_slot *s = &g_inference_ring_buf->slots[packing_slot_idx];
+								s->t0_gpu_received = clock64();
+								store_routing_context(s, hdr);
+								s->http_page_type = (uint8_t)page_type;
+								s->len = 0;
+								s->record_count = 0;
+							}
+						}
+
+						if (packing_slot_idx >= 0) {
+							struct inference_ring_slot *s = &g_inference_ring_buf->slots[packing_slot_idx];
+							int plen = extract_url_param(payload, payload_len,
+							                             s->data, packing_data_offset,
+							                             sizeof(s->data) - 1);
+							if (plen > 0) {
+								uint32_t rec = s->record_count;
+								s->directory[rec].offset = packing_data_offset;
+								s->directory[rec].length = plen;
+								s->record_count = rec + 1;
+								packing_data_offset += plen + 1;
+								s->len = packing_data_offset;
+							}
+						}
+					}
+				}
 				stats_thread.http_get++;
 			}
 			else if (filter_is_http_head(payload))
@@ -276,6 +348,16 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			/* TCP header may vary so a newer smaller packet may not overvwrite old longer packet */
 			wipe_packet_32b(payload);
 			buf_idx += blockDim.x;
+		}
+
+		/* Flush open packing slot at end of batch */
+		if (g_enable_packing && threadIdx.x == 0 && packing_slot_idx >= 0) {
+			if (g_inference_ring_buf->slots[packing_slot_idx].record_count > 0)
+				publish_slot(g_inference_ring_buf, packing_slot_idx);
+			else
+				release_slot(g_inference_ring_buf, packing_slot_idx);
+			packing_slot_idx = -1;
+			packing_data_offset = 0;
 		}
 
 #pragma unroll
@@ -373,6 +455,17 @@ doca_error_t kernel_receive_tcp(cudaStream_t stream, uint32_t *exit_cond, struct
 		return DOCA_ERROR_BAD_STATE;
 	}
 
+	return DOCA_SUCCESS;
+}
+
+doca_error_t set_packing_mode(int enable)
+{
+	cudaError_t err = cudaMemcpyToSymbol(g_enable_packing, &enable, sizeof(int));
+	if (err != cudaSuccess) {
+		DOCA_LOG_ERR("Failed to set packing mode: %s", cudaGetErrorString(err));
+		return DOCA_ERROR_DRIVER;
+	}
+	DOCA_LOG_INFO("Packing mode %s", enable ? "enabled" : "disabled");
 	return DOCA_SUCCESS;
 }
 

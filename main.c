@@ -704,6 +704,9 @@ int main(int argc, char **argv)
 		g_use_scan = 1;
 		DOCA_LOG_INFO("Using O(N) scan instead of O(1) FIFO");
 	}
+	int packing_enabled = getenv("GAZSI_ENABLE_PACKING") != NULL;
+	if (packing_enabled)
+		DOCA_LOG_INFO("Multi-record packing enabled");
 
 	g_cuda_id = cuda_id;
 	cudaFree(0);
@@ -862,6 +865,9 @@ int main(int argc, char **argv)
 	/*
 	 * Some GPUs may require an initial warmup without doing any real operation.
 	 */
+	if (packing_enabled)
+		set_packing_mode(1);
+
 	DOCA_LOG_INFO("Warm up CUDA kernels");
 	DOCA_GPUNETIO_VOLATILE(*cpu_exit_condition) = 1;
 	kernel_receive_tcp(rx_tcp_stream, gpu_exit_condition, &tcp_queues, app_cfg.http_server);

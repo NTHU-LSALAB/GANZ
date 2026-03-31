@@ -320,6 +320,8 @@ doca_error_t kernel_receive_tcp(cudaStream_t stream,
 				struct rxq_tcp_queues *tcp_queues,
 				bool http_server);
 
+doca_error_t set_packing_mode(int enable);
+
 /*
  * Launch a CUDA kernel to act as HTTP server
  *
