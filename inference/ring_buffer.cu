@@ -266,6 +266,10 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
     slot->data[len] = '\0';
     slot->len = len;
 
+    slot->record_count = 1;
+    slot->directory[0].offset = 0;
+    slot->directory[0].length = len;
+
     __atomic_store_n(&slot->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
 
     /* Push to response_queue so GPU TX can find it in O(1) */
@@ -300,14 +304,21 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
     if (index < 0)
         return -1;
 
+    struct inference_ring_slot *slot = &ring->slots[index];
+
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
-        ready_ref(*(uint32_t *)&ring->slots[index].ready);
+        ready_ref(*(uint32_t *)&slot->ready);
     ready_ref.store(UVM_STATUS_PROCESSING, cuda::memory_order_release);
 
     *request_id = atomicAdd((unsigned long long *)&ring->next_request_id, 1);
-    ring->slots[index].request_id = *request_id;
-    ring->slots[index].len = 0;
-    ring->slots[index].t1_slot_allocated = clock64();
+    slot->request_id = *request_id;
+    slot->len = 0;
+    slot->record_count = 0;
+    for (int i = 0; i < MAX_RECORDS_PER_SLOT; i++) {
+        slot->directory[i].offset = 0;
+        slot->directory[i].length = 0;
+    }
+    slot->t1_slot_allocated = clock64();
 
     return index;
 }
@@ -321,22 +332,30 @@ __device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *r
 
     slot->start_timestamp = clock64();
 
-    /* Q3: cap copy at sizeof(data)-1 to prevent overflow */
     uint32_t max_len = sizeof(slot->data) - 1;
+    uint32_t offset = slot->len;
+    uint32_t rec = slot->record_count;
+
     uint32_t len = 0;
-    while (data[len] != '\0' && len < max_len) {
-        slot->data[len] = data[len];
+    while (data[len] != '\0' && (offset + len) < max_len)
         len++;
+
+    for (uint32_t i = 0; i < len; i++)
+        slot->data[offset + i] = data[i];
+    slot->data[offset + len] = '\0';
+
+    if (rec < MAX_RECORDS_PER_SLOT) {
+        slot->directory[rec].offset = offset;
+        slot->directory[rec].length = len;
+        slot->record_count = rec + 1;
     }
-    slot->data[len] = '\0';
-    slot->len = len;
+    slot->len = offset + len;
 
     slot->t2_gpu_wrote_uvm = clock64();
 
     pending_ref.fetch_add(1, cuda::memory_order_release);
     ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
 
-    /* Push to request_queue so CPU can find this slot in O(1) */
     gpu_iq_push(&ring->request_queue, slot_index);
 }
 

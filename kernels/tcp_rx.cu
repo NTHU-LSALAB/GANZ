@@ -186,9 +186,10 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 							uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_header_len;
 
 							slot->len = 0;
-							slot->data[0] = '\0';
+						slot->record_count = 0;
+						slot->data[0] = '\0';
 
-							/* Fast path: /inference?d= has "?d=" at known offset */
+						/* Fast path: /inference?d= has "?d=" at known offset */
 							int param_start = -1;
 							if (payload_len > 18 &&
 							    payload[15] == '?' && payload[16] == 'd' && payload[17] == '=') {
@@ -229,8 +230,11 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 								slot->len = param_len;
 							}
 
-					/* Only set PARAM_READY if valid parameter was extracted */
-				if (slot->len > 0) {
+				/* Only set PARAM_READY if valid parameter was extracted */
+			if (slot->len > 0) {
+					slot->record_count = 1;
+					slot->directory[0].offset = 0;
+					slot->directory[0].length = slot->len;
 					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
 						pending_ref(*(uint32_t*)&g_inference_ring_buf->pending_count);
 					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>

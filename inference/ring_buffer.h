@@ -25,30 +25,30 @@
 #define UVM_STATUS_CONSUMED     4  /* GPU has read result */
 
 /*
+ * Record Directory entry — describes one request within a packed slot
+ */
+#define MAX_RECORDS_PER_SLOT 8
+
+struct record_entry {
+    uint32_t offset;    /* byte offset within data[] buffer */
+    uint32_t length;    /* byte length of this record's payload */
+};
+
+/*
  * Ring Buffer slot structure
- * Cache-line aligned: hot data in first cache line (128 bytes)
+ * Cache-line aligned: Control Header + Record Directory in first cache line
  */
 struct inference_ring_slot {
-    /* Cache Line 1: Hot data - frequently accessed fields (128 bytes) */
-    volatile uint32_t ready;           /* State - polled by GPU/CPU */
-    volatile uint32_t len;             /* Current data length */
-    volatile uint64_t request_id;      /* Request ID */
-    volatile uint64_t start_timestamp; /* GPU processing start timestamp */
+    /* Cache Line 1: Control Header + Record Directory (128 bytes) */
+    volatile uint32_t ready;           /* 4B: Ownership state */
+    volatile uint32_t record_count;    /* 4B: Number of records packed in slot */
+    volatile uint64_t request_id;      /* 8B: Request ID (first record) */
+    volatile uint32_t len;             /* 4B: Total payload bytes across all records */
+    uint32_t _pad_ctrl;                /* 4B: alignment */
+    struct record_entry directory[MAX_RECORDS_PER_SLOT]; /* 64B: Record Directory */
+    char _pad_dir[40];                 /* 40B: pad to 128 bytes */
 
-    /* Performance timing (9 timestamps for detailed profiling) */
-    volatile uint64_t t0_gpu_received;   /* T0: HTTP request arrived at GPU */
-    volatile uint64_t t1_slot_allocated; /* T1: GPU allocated ring slot */
-    volatile uint64_t t2_gpu_wrote_uvm;  /* T2: GPU finished writing to UVM */
-    volatile uint64_t t3_cpu_read;       /* T3: CPU detected data */
-    volatile uint64_t t4_tensorrt_start; /* T4: CPU started TensorRT inference */
-    volatile uint64_t t5_tensorrt_end;   /* T5: TensorRT inference complete */
-    volatile uint64_t t6_cpu_wrote_uvm;  /* T6: CPU wrote result to UVM */
-    volatile uint64_t t7_gpu_read;       /* T7: GPU detected result */
-    volatile uint64_t t8_gpu_sent;       /* T8: GPU sent HTTP response */
-
-    char padding1[16];                 /* Padding to 128 bytes */
-
-    /* TCP connection info for HTTP response construction */
+    /* TCP Routing Context (40 bytes) — shared by all records (same connection) */
     uint8_t eth_src_addr_bytes[6];     /* Ethernet source address */
     uint8_t eth_dst_addr_bytes[6];     /* Ethernet destination address */
     uint32_t ip_src_addr;              /* IP source address */
@@ -61,11 +61,22 @@ struct inference_ring_slot {
     uint32_t tcp_sent_seq;             /* TCP sent sequence number */
     uint32_t tcp_recv_ack;             /* TCP receive acknowledgment */
     char padding_tcp[2];               /* Alignment padding */
-    /* TCP info: 6+6+4+4+2+2+2+1+1+4+4+2 = 38 bytes, aligned to 40 */
 
-    /* Cache Lines 2-8: Cold data - accessed only when needed */
-    char data[856];                    /* Data buffer (896 - 40 = 856) */
-    char padding2[128];                /* Align to cache lines */
+    /* Profiling Timestamps (80 bytes) — moved out of hot cache line */
+    volatile uint64_t start_timestamp; /* GPU processing start timestamp */
+    volatile uint64_t t0_gpu_received;   /* T0: HTTP request arrived at GPU */
+    volatile uint64_t t1_slot_allocated; /* T1: GPU allocated ring slot */
+    volatile uint64_t t2_gpu_wrote_uvm;  /* T2: GPU finished writing to UVM */
+    volatile uint64_t t3_cpu_read;       /* T3: CPU detected data */
+    volatile uint64_t t4_tensorrt_start; /* T4: CPU started TensorRT inference */
+    volatile uint64_t t5_tensorrt_end;   /* T5: TensorRT inference complete */
+    volatile uint64_t t6_cpu_wrote_uvm;  /* T6: CPU wrote result to UVM */
+    volatile uint64_t t7_gpu_read;       /* T7: GPU detected result */
+    volatile uint64_t t8_gpu_sent;       /* T8: GPU sent HTTP response */
+
+    /* Data Buffer — holds packed payloads for all records */
+    char data[856];                    /* Payload buffer */
+    char padding2[48];                 /* Pad to 1152 bytes (9 cache lines) */
 } __attribute__((aligned(128)));
 
 /*
