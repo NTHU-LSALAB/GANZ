@@ -201,10 +201,9 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 	__shared__ uint64_t rx_buf_idx;
 	__shared__ struct stats_tcp stats_sh;
 
-	/* Packing state: per-block shared slot for multi-record packing */
-	__shared__ int packing_slot_idx;
-	__shared__ uint32_t packing_conn_hash;
-	__shared__ uint32_t packing_data_offset;
+	__shared__ int pending_slots[64];
+	__shared__ uint32_t pending_hashes[64];
+	__shared__ int pending_count;
 
 	doca_error_t ret;
 	struct doca_gpu_eth_rxq *rxq = NULL;
@@ -249,9 +248,7 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 		DOCA_GPUNETIO_VOLATILE(stats_sh.tcp_fin) = 0;
 		DOCA_GPUNETIO_VOLATILE(stats_sh.tcp_ack) = 0;
 		DOCA_GPUNETIO_VOLATILE(stats_sh.others) = 0;
-		packing_slot_idx = -1;
-		packing_conn_hash = 0;
-		packing_data_offset = 0;
+		pending_count = 0;
 	}
 	__syncthreads();
 
@@ -309,8 +306,7 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 					uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_hdr_len;
 					enum http_page_get page_type = get_http_page_type(payload);
 
-					if (!g_enable_packing) {
-						/* === Parallel path (default): one slot per request === */
+					{
 						uint64_t request_id = 0;
 						int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
 						if (slot_idx >= 0) {
@@ -328,51 +324,21 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 								slot->record_count = 1;
 								slot->directory[0].offset = 0;
 								slot->directory[0].length = plen;
-								publish_slot(g_inference_ring_buf, slot_idx);
+
+								if (!g_enable_packing) {
+									publish_slot(g_inference_ring_buf, slot_idx);
+								} else {
+									uint32_t ch = conn_hash_from_hdr(hdr);
+									int pi = atomicAdd(&pending_count, 1);
+									if (pi < 64) {
+										pending_slots[pi] = slot_idx;
+										pending_hashes[pi] = ch;
+									} else {
+										publish_slot(g_inference_ring_buf, slot_idx);
+									}
+								}
 							} else {
 								release_slot(g_inference_ring_buf, slot_idx);
-							}
-						}
-					} else if (threadIdx.x == 0) {
-						/* === Packing path (thread-0 serial): multi-record slots === */
-						uint32_t ch = conn_hash_from_hdr(hdr);
-						bool need_new_slot = (packing_slot_idx < 0)
-						    || (ch != packing_conn_hash)
-						    || (g_inference_ring_buf->slots[packing_slot_idx].record_count >= MAX_RECORDS_PER_SLOT)
-						    || (packing_data_offset + 512 > sizeof(g_inference_ring_buf->slots[0].data));
-
-						if (need_new_slot) {
-							if (packing_slot_idx >= 0 && g_inference_ring_buf->slots[packing_slot_idx].record_count > 0)
-								publish_slot(g_inference_ring_buf, packing_slot_idx);
-							else if (packing_slot_idx >= 0)
-								release_slot(g_inference_ring_buf, packing_slot_idx);
-
-							uint64_t rid = 0;
-							packing_slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &rid);
-							packing_conn_hash = ch;
-							packing_data_offset = 0;
-							if (packing_slot_idx >= 0) {
-								struct inference_ring_slot *s = &g_inference_ring_buf->slots[packing_slot_idx];
-								s->t0_gpu_received = clock64();
-								store_routing_context(s, hdr);
-								s->http_page_type = (uint8_t)page_type;
-								s->len = 0;
-								s->record_count = 0;
-							}
-						}
-
-						if (packing_slot_idx >= 0) {
-							struct inference_ring_slot *s = &g_inference_ring_buf->slots[packing_slot_idx];
-							int plen = extract_url_param(payload, payload_len,
-							                             s->data, packing_data_offset,
-							                             sizeof(s->data) - 1);
-							if (plen > 0) {
-								uint32_t rec = s->record_count;
-								s->directory[rec].offset = packing_data_offset;
-								s->directory[rec].length = plen;
-								s->record_count = rec + 1;
-								packing_data_offset += plen + 1;
-								s->len = packing_data_offset;
 							}
 						}
 					}
@@ -429,14 +395,42 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			buf_idx += blockDim.x;
 		}
 
-		/* Flush open packing slot at end of batch */
-		if (g_enable_packing && threadIdx.x == 0 && packing_slot_idx >= 0) {
-			if (g_inference_ring_buf->slots[packing_slot_idx].record_count > 0)
-				publish_slot(g_inference_ring_buf, packing_slot_idx);
-			else
-				release_slot(g_inference_ring_buf, packing_slot_idx);
-			packing_slot_idx = -1;
-			packing_data_offset = 0;
+		/* Phase 2: thread 0 merges same-connection slots, then publishes all */
+		if (g_enable_packing) {
+			__syncthreads();
+			if (threadIdx.x == 0) {
+				int n = pending_count;
+				if (n > 64) n = 64;
+				int i = 0;
+				while (i < n) {
+					int base = pending_slots[i];
+					uint32_t base_hash = pending_hashes[i];
+					struct inference_ring_slot *bs = &g_inference_ring_buf->slots[base];
+					int j = i + 1;
+					while (j < n && pending_hashes[j] == base_hash
+					       && bs->record_count < MAX_RECORDS_PER_SLOT) {
+						struct inference_ring_slot *src = &g_inference_ring_buf->slots[pending_slots[j]];
+						uint32_t dst_off = bs->len;
+						uint32_t src_len = src->directory[0].length;
+						if (dst_off + src_len + 1 > sizeof(bs->data))
+							break;
+						for (uint32_t k = 0; k < src_len; k++)
+							bs->data[dst_off + k] = src->data[k];
+						bs->data[dst_off + src_len] = '\0';
+						uint32_t rec = bs->record_count;
+						bs->directory[rec].offset = dst_off;
+						bs->directory[rec].length = src_len;
+						bs->record_count = rec + 1;
+						bs->len = dst_off + src_len + 1;
+						release_slot(g_inference_ring_buf, pending_slots[j]);
+						j++;
+					}
+					publish_slot(g_inference_ring_buf, base);
+					i = j;
+				}
+				pending_count = 0;
+			}
+			__syncthreads();
 		}
 
 #pragma unroll
