@@ -307,11 +307,22 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 
 							if (cs->active && cs->conn_hash == conn_h) {
 								uint32_t tcp_payload_size = nbytes_page;
-								cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
-									seq_ref(*(uint32_t *)&cs->sent_seq);
-								uint32_t my_seq = seq_ref.fetch_add(tcp_payload_size, cuda::memory_order_relaxed);
-								my_seq_n = BYTE_SWAP32(my_seq);
-								my_ack_n = BYTE_SWAP32(cs->recv_ack);
+								uint32_t cur_seq = cs->sent_seq;
+								uint32_t last_ack = cs->recv_ack;
+								uint32_t cwnd = cs->cwnd;
+								uint32_t bytes_in_flight = cur_seq - last_ack;
+								if (bytes_in_flight > 0x80000000u) bytes_in_flight = 0;
+
+								if (bytes_in_flight + tcp_payload_size <= cwnd) {
+									cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+										seq_ref(*(uint32_t *)&cs->sent_seq);
+									uint32_t my_seq = seq_ref.fetch_add(tcp_payload_size, cuda::memory_order_relaxed);
+									my_seq_n = BYTE_SWAP32(my_seq);
+									my_ack_n = BYTE_SWAP32(last_ack);
+								} else {
+									my_seq_n = current_slot->tcp_sent_seq;
+									my_ack_n = current_slot->tcp_recv_ack;
+								}
 							} else {
 								my_seq_n = current_slot->tcp_sent_seq;
 								my_ack_n = current_slot->tcp_recv_ack;

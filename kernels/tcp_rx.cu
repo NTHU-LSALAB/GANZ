@@ -117,8 +117,19 @@ static __device__ void conn_table_update_recv(struct inference_ring_buffer *ring
 
 	if (pkt_seq == expected) {
 		cs->expected_seq = new_ack;
-		cs->dup_ack_count = 0;
 		atomicMax((uint32_t *)&cs->recv_ack, new_ack);
+
+		if (cs->dup_ack_count >= 3) {
+			uint32_t half = cs->cwnd / 2;
+			if (half < 1460) half = 1460;
+			cs->cwnd = half;
+			cs->ssthresh = half;
+		} else if (cs->cwnd < cs->ssthresh) {
+			cs->cwnd += 1460;
+		} else {
+			cs->cwnd += 1460 * 1460 / cs->cwnd;
+		}
+		cs->dup_ack_count = 0;
 
 		for (int i = 0; i < (int)cs->reorder_count; i++) {
 			if (cs->reorder_seq[i] == new_ack) {
@@ -138,6 +149,12 @@ static __device__ void conn_table_update_recv(struct inference_ring_buffer *ring
 			cs->reorder_count = rc + 1;
 		}
 		cs->dup_ack_count++;
+		if (cs->dup_ack_count == 3) {
+			uint32_t half = cs->cwnd / 2;
+			if (half < 1460) half = 1460;
+			cs->cwnd = half;
+			cs->ssthresh = half;
+		}
 	} else {
 		cs->dup_ack_count++;
 	}
