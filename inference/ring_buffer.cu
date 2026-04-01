@@ -135,10 +135,20 @@ extern "C" void gpu_conn_table_init_entry(struct inference_ring_buffer *ring,
                                           uint32_t conn_hash, uint32_t sent_seq, uint32_t recv_ack)
 {
     uint32_t idx = conn_hash & (GPU_CONN_TABLE_SIZE - 1);
-    ring->conn_table[idx].conn_hash = conn_hash;
-    ring->conn_table[idx].sent_seq = sent_seq;
-    ring->conn_table[idx].recv_ack = recv_ack;
-    __atomic_store_n((uint32_t *)&ring->conn_table[idx].active, 1, __ATOMIC_RELEASE);
+    struct gpu_conn_state *cs = &ring->conn_table[idx];
+    cs->conn_hash = conn_hash;
+    cs->sent_seq = sent_seq;
+    cs->recv_ack = recv_ack;
+    cs->cwnd = 10 * 1460;
+    cs->ssthresh = 65535;
+    cs->expected_seq = recv_ack;
+    cs->dup_ack_count = 0;
+    cs->reorder_count = 0;
+    for (int i = 0; i < 4; i++) {
+        cs->reorder_seq[i] = 0;
+        cs->reorder_len[i] = 0;
+    }
+    __atomic_store_n((uint32_t *)&cs->active, 1, __ATOMIC_RELEASE);
 }
 
 extern "C" void gpu_conn_table_clear_entry(struct inference_ring_buffer *ring, uint32_t conn_hash)
@@ -195,10 +205,7 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
         g_ring_host->response_queue.entries[i] = IQ_EMPTY;
 
     for (int i = 0; i < GPU_CONN_TABLE_SIZE; i++) {
-        g_ring_host->conn_table[i].active = 0;
-        g_ring_host->conn_table[i].conn_hash = 0;
-        g_ring_host->conn_table[i].sent_seq = 0;
-        g_ring_host->conn_table[i].recv_ack = 0;
+        memset((void *)&g_ring_host->conn_table[i], 0, sizeof(struct gpu_conn_state));
     }
 
     /* Clock synchronization - measure actual GPU frequency */

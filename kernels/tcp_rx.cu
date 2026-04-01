@@ -105,12 +105,42 @@ static __device__ struct gpu_conn_state* conn_table_lookup(struct inference_ring
 	return nullptr;
 }
 
-static __device__ void conn_table_update_recv_ack(struct inference_ring_buffer *ring,
-                                                   uint32_t conn_hash, uint32_t new_ack)
+static __device__ void conn_table_update_recv(struct inference_ring_buffer *ring,
+                                               uint32_t conn_hash,
+                                               uint32_t pkt_seq, uint32_t pkt_len)
 {
 	struct gpu_conn_state *cs = conn_table_lookup(ring, conn_hash);
-	if (cs)
+	if (!cs) return;
+
+	uint32_t new_ack = pkt_seq + pkt_len;
+	uint32_t expected = cs->expected_seq;
+
+	if (pkt_seq == expected) {
+		cs->expected_seq = new_ack;
+		cs->dup_ack_count = 0;
 		atomicMax((uint32_t *)&cs->recv_ack, new_ack);
+
+		for (int i = 0; i < (int)cs->reorder_count; i++) {
+			if (cs->reorder_seq[i] == new_ack) {
+				cs->expected_seq = cs->reorder_seq[i] + cs->reorder_len[i];
+				atomicMax((uint32_t *)&cs->recv_ack, cs->expected_seq);
+				cs->reorder_seq[i] = cs->reorder_seq[cs->reorder_count - 1];
+				cs->reorder_len[i] = cs->reorder_len[cs->reorder_count - 1];
+				cs->reorder_count--;
+				i--;
+			}
+		}
+	} else if (pkt_seq > expected) {
+		if (cs->reorder_count < 4) {
+			uint32_t rc = cs->reorder_count;
+			cs->reorder_seq[rc] = pkt_seq;
+			cs->reorder_len[rc] = pkt_len;
+			cs->reorder_count = rc + 1;
+		}
+		cs->dup_ack_count++;
+	} else {
+		cs->dup_ack_count++;
+	}
 }
 
 static __device__ void store_routing_context(struct inference_ring_slot *slot,
@@ -327,8 +357,8 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 						uint32_t ch = conn_hash_from_hdr(hdr);
 						uint32_t client_data_len = BYTE_SWAP16(hdr->l3_hdr.total_length)
 						    - sizeof(struct ipv4_hdr) - ((hdr->l4_hdr.dt_off >> 4) * 4);
-						uint32_t new_ack = BYTE_SWAP32(hdr->l4_hdr.sent_seq) + client_data_len;
-						conn_table_update_recv_ack(g_inference_ring_buf, ch, new_ack);
+						uint32_t pkt_seq = BYTE_SWAP32(hdr->l4_hdr.sent_seq);
+						conn_table_update_recv(g_inference_ring_buf, ch, pkt_seq, client_data_len);
 
 						uint64_t request_id = 0;
 						int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);

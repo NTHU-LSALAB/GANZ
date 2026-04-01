@@ -43,6 +43,13 @@ struct gpu_conn_state {
     volatile uint32_t conn_hash;
     volatile uint32_t sent_seq;
     volatile uint32_t recv_ack;
+    volatile uint32_t cwnd;
+    volatile uint32_t ssthresh;
+    volatile uint32_t expected_seq;
+    volatile uint32_t dup_ack_count;
+    volatile uint32_t reorder_seq[4];
+    volatile uint32_t reorder_len[4];
+    volatile uint32_t reorder_count;
 };
 
 /*
