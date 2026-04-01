@@ -297,12 +297,26 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 						hdr->l3_hdr.dst_addr = current_slot->ip_dst_addr;
 						hdr->l4_hdr.src_port = current_slot->tcp_src_port;
 						hdr->l4_hdr.dst_port = current_slot->tcp_dst_port;
-						uint32_t rec_seq = current_slot->directory[rec].tcp_sent_seq;
-						uint32_t rec_ack = current_slot->directory[rec].tcp_recv_ack;
-						if (rec_seq == 0 && rec == 0) rec_seq = current_slot->tcp_sent_seq;
-						if (rec_ack == 0 && rec == 0) rec_ack = current_slot->tcp_recv_ack;
-						hdr->l4_hdr.sent_seq = rec_seq;
-						hdr->l4_hdr.recv_ack = rec_ack;
+						uint32_t conn_h = current_slot->ip_src_addr ^ current_slot->ip_dst_addr;
+						conn_h ^= (uint32_t)current_slot->tcp_src_port ^ (uint32_t)current_slot->tcp_dst_port;
+						conn_h ^= (conn_h >> 16);
+						uint32_t ct_idx = conn_h & (GPU_CONN_TABLE_SIZE - 1);
+						struct gpu_conn_state *cs = &g_inference_ring_buf->conn_table[ct_idx];
+
+						uint32_t my_seq, my_ack;
+						if (cs->active && cs->conn_hash == conn_h) {
+							uint32_t pkt_total = base_pkt_len + nbytes_page;
+							uint32_t tcp_payload_size = pkt_total - sizeof(struct ether_hdr) - sizeof(struct ipv4_hdr) - sizeof(struct tcp_hdr);
+							cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+								seq_ref(*(uint32_t *)&cs->sent_seq);
+							my_seq = seq_ref.fetch_add(tcp_payload_size, cuda::memory_order_relaxed);
+							my_ack = cs->recv_ack;
+							hdr->l4_hdr.sent_seq = BYTE_SWAP32(my_seq);
+							hdr->l4_hdr.recv_ack = BYTE_SWAP32(my_ack);
+						} else {
+							hdr->l4_hdr.sent_seq = current_slot->tcp_sent_seq;
+							hdr->l4_hdr.recv_ack = current_slot->tcp_recv_ack;
+						}
 
 						hdr->l4_hdr.tcp_flags = TCP_FLAG_ACK | TCP_FLAG_PSH;
 						hdr->l4_hdr.cksum = 0;

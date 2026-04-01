@@ -914,6 +914,7 @@ int main(int argc, char **argv)
 			DOCA_LOG_ERR("Failed to initialize UVM inference buffer");
 			return EXIT_FAILURE;
 		}
+		tcp_queues.ring = g_inference_ring_buf;
 
 		/* Set GPU-side UVM buffer pointer */
 		result = set_inference_ring_buffer_kernel(tx_http_server, g_inference_ring_buf);

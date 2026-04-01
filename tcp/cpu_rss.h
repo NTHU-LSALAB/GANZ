@@ -48,16 +48,11 @@ const struct rte_tcp_hdr *extract_tcp_hdr(const struct rte_mbuf *packet);
 doca_error_t create_tcp_session(const uint16_t queue_id,
 				const struct rte_mbuf *pkt,
 				struct doca_flow_port *port,
-				struct doca_flow_pipe *gpu_rss_pipe);
+				struct doca_flow_pipe *gpu_rss_pipe,
+				struct inference_ring_buffer *ring);
 
-/*
- * Destroy TCP session
- *
- * @queue_id [in]: DPDK queue id for TCP control packets
- * @pkt [in]: pkt triggering the TCP session destruction
- * @port [in]: DOCA Flow port
- */
-void destroy_tcp_session(const uint16_t queue_id, const struct rte_mbuf *pkt, struct doca_flow_port *port);
+void destroy_tcp_session(const uint16_t queue_id, const struct rte_mbuf *pkt, struct doca_flow_port *port,
+			 struct inference_ring_buffer *ring);
 
 /*
  * Log TCP flags

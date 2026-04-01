@@ -36,6 +36,15 @@ struct record_entry {
     uint32_t tcp_recv_ack;
 };
 
+#define GPU_CONN_TABLE_SIZE 256
+
+struct gpu_conn_state {
+    volatile uint32_t active;
+    volatile uint32_t conn_hash;
+    volatile uint32_t sent_seq;
+    volatile uint32_t recv_ack;
+};
+
 /*
  * Ring Buffer slot structure
  * Cache-line aligned: Control Header + Record Directory in first cache line
@@ -139,7 +148,8 @@ struct inference_ring_buffer {
     struct index_queue request_queue   __attribute__((aligned(128)));
     struct index_queue response_queue  __attribute__((aligned(128)));
 
-    /* Clock sync - set once at init, read-only thereafter */
+    struct gpu_conn_state conn_table[GPU_CONN_TABLE_SIZE] __attribute__((aligned(128)));
+
     struct clock_sync_info clock_sync;
 };
 
@@ -153,6 +163,10 @@ extern "C" {
 
 /* Initialize Ring Buffer. Returns pointer, NULL on failure */
 struct inference_ring_buffer* init_inference_ring_buffer(int doca_gpu_id);
+
+void gpu_conn_table_init_entry(struct inference_ring_buffer *ring,
+                               uint32_t conn_hash, uint32_t sent_seq, uint32_t recv_ack);
+void gpu_conn_table_clear_entry(struct inference_ring_buffer *ring, uint32_t conn_hash);
 
 /* Set inference result notification semaphore (CPU-side, for notifying GPU after writing result) */
 void set_inference_semaphore_cpu(struct doca_gpu_semaphore *sem_cpu);

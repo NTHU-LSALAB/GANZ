@@ -74,14 +74,14 @@ int tcp_cpu_rss_func(void *lcore_args)
 
 			if (tcp_hdr->rst) {
 				log_tcp_flag(pkt, "RST");
-				destroy_tcp_session(queue_id, pkt, tcp_queues->port);
+				destroy_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->ring);
 				continue; // Do not bother to ack
 			} else if (tcp_hdr->fin) {
 				log_tcp_flag(pkt, "FIN");
-				destroy_tcp_session(queue_id, pkt, tcp_queues->port);
+				destroy_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->ring);
 			} else if (tcp_hdr->syn) {
 				log_tcp_flag(pkt, "SYN");
-				result = create_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->rxq_pipe_gpu);
+				result = create_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->rxq_pipe_gpu, tcp_queues->ring);
 				if (result != DOCA_SUCCESS)
 					goto error;
 			} else {
@@ -143,7 +143,8 @@ const struct rte_tcp_hdr *extract_tcp_hdr(const struct rte_mbuf *packet)
 doca_error_t create_tcp_session(const uint16_t queue_id,
 				const struct rte_mbuf *pkt,
 				struct doca_flow_port *port,
-				struct doca_flow_pipe *gpu_rss_pipe)
+				struct doca_flow_pipe *gpu_rss_pipe,
+				struct inference_ring_buffer *ring)
 {
 	int ret;
 	doca_error_t result;
@@ -168,10 +169,21 @@ doca_error_t create_tcp_session(const uint16_t queue_id,
 		return DOCA_ERROR_DRIVER;
 	}
 
+	if (ring) {
+		const struct rte_tcp_hdr *tcp = extract_tcp_hdr(pkt);
+		const struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod_offset(pkt, const struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+		uint32_t ch = ip->src_addr ^ ip->dst_addr;
+		ch ^= (uint32_t)tcp->src_port ^ (uint32_t)tcp->dst_port;
+		ch ^= (ch >> 16);
+		uint32_t client_isn = rte_be_to_cpu_32(tcp->sent_seq);
+		gpu_conn_table_init_entry(ring, ch, 1001, client_isn + 1);
+	}
+
 	return DOCA_SUCCESS;
 }
 
-void destroy_tcp_session(const uint16_t queue_id, const struct rte_mbuf *pkt, struct doca_flow_port *port)
+void destroy_tcp_session(const uint16_t queue_id, const struct rte_mbuf *pkt, struct doca_flow_port *port,
+			 struct inference_ring_buffer *ring)
 {
 	const struct tcp_session_key key = extract_session_key(pkt);
 	struct tcp_session_entry *session_entry = NULL;
@@ -180,6 +192,15 @@ void destroy_tcp_session(const uint16_t queue_id, const struct rte_mbuf *pkt, st
 		return;
 
 	disable_tcp_gpu_offload(port, queue_id, session_entry);
+
+	if (ring) {
+		const struct rte_tcp_hdr *tcp = extract_tcp_hdr(pkt);
+		const struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod_offset(pkt, const struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+		uint32_t ch = ip->src_addr ^ ip->dst_addr;
+		ch ^= (uint32_t)tcp->src_port ^ (uint32_t)tcp->dst_port;
+		ch ^= (ch >> 16);
+		gpu_conn_table_clear_entry(ring, ch);
+	}
 
 	rte_hash_del_key(tcp_session_table, &key);
 	rte_free(session_entry);

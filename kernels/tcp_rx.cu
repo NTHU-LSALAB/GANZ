@@ -47,7 +47,7 @@ __device__ enum http_page_get get_http_page_type(const uint8_t *payload)
 static __device__ uint32_t conn_hash_from_hdr(const struct eth_ip_tcp_hdr *hdr)
 {
 	uint32_t h = hdr->l3_hdr.src_addr ^ hdr->l3_hdr.dst_addr;
-	h ^= (uint32_t)hdr->l4_hdr.src_port << 16 | (uint32_t)hdr->l4_hdr.dst_port;
+	h ^= (uint32_t)hdr->l4_hdr.src_port ^ (uint32_t)hdr->l4_hdr.dst_port;
 	h ^= (h >> 16);
 	return h;
 }
@@ -94,6 +94,23 @@ static __device__ int extract_url_param(const uint8_t *payload, uint32_t payload
 	}
 	dst[dst_offset + len] = '\0';
 	return len;
+}
+
+static __device__ struct gpu_conn_state* conn_table_lookup(struct inference_ring_buffer *ring,
+                                                           uint32_t conn_hash)
+{
+	uint32_t idx = conn_hash & (GPU_CONN_TABLE_SIZE - 1);
+	if (ring->conn_table[idx].active && ring->conn_table[idx].conn_hash == conn_hash)
+		return &ring->conn_table[idx];
+	return nullptr;
+}
+
+static __device__ void conn_table_update_recv_ack(struct inference_ring_buffer *ring,
+                                                   uint32_t conn_hash, uint32_t new_ack)
+{
+	struct gpu_conn_state *cs = conn_table_lookup(ring, conn_hash);
+	if (cs)
+		atomicMax((uint32_t *)&cs->recv_ack, new_ack);
 }
 
 static __device__ void store_routing_context(struct inference_ring_slot *slot,
@@ -307,6 +324,12 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 					enum http_page_get page_type = get_http_page_type(payload);
 
 					{
+						uint32_t ch = conn_hash_from_hdr(hdr);
+						uint32_t client_data_len = BYTE_SWAP16(hdr->l3_hdr.total_length)
+						    - sizeof(struct ipv4_hdr) - ((hdr->l4_hdr.dt_off >> 4) * 4);
+						uint32_t new_ack = BYTE_SWAP32(hdr->l4_hdr.sent_seq) + client_data_len;
+						conn_table_update_recv_ack(g_inference_ring_buf, ch, new_ack);
+
 						uint64_t request_id = 0;
 						int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
 						if (slot_idx >= 0) {

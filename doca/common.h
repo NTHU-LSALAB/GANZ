@@ -23,8 +23,9 @@ struct app_gpu_cfg {
 
 /* Application TCP receive queues objects */
 struct rxq_tcp_queues {
-	struct doca_gpu *gpu_dev; /* GPUNetio handler associated to queues */
-	struct doca_dev *ddev;	  /* DOCA device handler associated to queues */
+	struct doca_gpu *gpu_dev;
+	struct doca_dev *ddev;
+	struct inference_ring_buffer *ring;
 
 	uint16_t numq;			      /* Number of queues processed in the GPU */
 	uint16_t numq_cpu_rss;		      /* Number of queues processed in the CPU */

@@ -131,6 +131,25 @@ __global__ void get_gpu_clock_kernel(uint64_t *output) {
     }
 }
 
+extern "C" void gpu_conn_table_init_entry(struct inference_ring_buffer *ring,
+                                          uint32_t conn_hash, uint32_t sent_seq, uint32_t recv_ack)
+{
+    uint32_t idx = conn_hash & (GPU_CONN_TABLE_SIZE - 1);
+    ring->conn_table[idx].conn_hash = conn_hash;
+    ring->conn_table[idx].sent_seq = sent_seq;
+    ring->conn_table[idx].recv_ack = recv_ack;
+    __atomic_store_n((uint32_t *)&ring->conn_table[idx].active, 1, __ATOMIC_RELEASE);
+}
+
+extern "C" void gpu_conn_table_clear_entry(struct inference_ring_buffer *ring, uint32_t conn_hash)
+{
+    uint32_t idx = conn_hash & (GPU_CONN_TABLE_SIZE - 1);
+    __atomic_store_n((uint32_t *)&ring->conn_table[idx].active, 0, __ATOMIC_RELEASE);
+    ring->conn_table[idx].conn_hash = 0;
+    ring->conn_table[idx].sent_seq = 0;
+    ring->conn_table[idx].recv_ack = 0;
+}
+
 struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
 {
     cudaSetDevice(gpu_id);
@@ -174,6 +193,13 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
     g_ring_host->response_queue.tail = 0;
     for (int i = 0; i < IQ_CAPACITY; i++)
         g_ring_host->response_queue.entries[i] = IQ_EMPTY;
+
+    for (int i = 0; i < GPU_CONN_TABLE_SIZE; i++) {
+        g_ring_host->conn_table[i].active = 0;
+        g_ring_host->conn_table[i].conn_hash = 0;
+        g_ring_host->conn_table[i].sent_seq = 0;
+        g_ring_host->conn_table[i].recv_ack = 0;
+    }
 
     /* Clock synchronization - measure actual GPU frequency */
     uint64_t *d_gpu_clock;
