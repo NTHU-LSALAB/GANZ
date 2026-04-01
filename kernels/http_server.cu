@@ -330,9 +330,11 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 						hdr->l3_hdr.total_length = BYTE_SWAP16(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + nbytes_page);
 						hdr->l3_hdr.hdr_checksum = 0;
 
-						ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
-						if (ret != DOCA_SUCCESS) break;
-						send_pkts++;
+						if (lane_id == 0) {
+							ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
+							send_pkts++;
+						}
+						__syncwarp();
 
 						if (rec + 1 < nrec) {
 							if (lane_id == 0) {
@@ -357,13 +359,15 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				hdr->l3_hdr.total_length = BYTE_SWAP16(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + nbytes_page);
 				hdr->l3_hdr.hdr_checksum = 0;
 
-				ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
-				if (ret != DOCA_SUCCESS) {
-					printf("Error %d doca_gpu_dev_eth_txq_send_enqueue_strong block %d thread %d\n", ret, warp_id, lane_id);
-					DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
-					break;
+				if (lane_id == 0) {
+					ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
+					if (ret != DOCA_SUCCESS) {
+						printf("Error %d doca_gpu_dev_eth_txq_send_enqueue_strong block %d thread %d\n", ret, warp_id, lane_id);
+						DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
+					}
+					send_pkts++;
 				}
-				send_pkts++;
+				__syncwarp();
 				}
 
 				{
