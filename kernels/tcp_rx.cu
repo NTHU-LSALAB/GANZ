@@ -232,6 +232,91 @@ static __device__ int extract_post_body(const uint8_t *payload, uint32_t payload
 	return copy_len;
 }
 
+static __device__ bool is_chunked_encoding(const uint8_t *payload, uint32_t payload_len)
+{
+	for (int i = 0; i < (int)payload_len - 27 && i < 2048; i++) {
+		if ((payload[i] == 'T' || payload[i] == 't') &&
+		    (payload[i+1] == 'r' || payload[i+1] == 'R')) {
+			bool match = true;
+			const char *te = "ansfer-encoding: chunked";
+			for (int k = 0; k < 24 && match; k++) {
+				char c = payload[i + 2 + k];
+				if (c >= 'A' && c <= 'Z') c += 32;
+				char e = te[k];
+				if (e >= 'A' && e <= 'Z') e += 32;
+				if (c != e) match = false;
+			}
+			if (match) return true;
+		}
+	}
+	return false;
+}
+
+static __device__ int parse_hex(const uint8_t *buf, int len, int *consumed)
+{
+	int val = 0;
+	int i = 0;
+	while (i < len) {
+		uint8_t c = buf[i];
+		if (c >= '0' && c <= '9') val = val * 16 + (c - '0');
+		else if (c >= 'a' && c <= 'f') val = val * 16 + (c - 'a' + 10);
+		else if (c >= 'A' && c <= 'F') val = val * 16 + (c - 'A' + 10);
+		else break;
+		i++;
+	}
+	*consumed = i;
+	return val;
+}
+
+static __device__ int extract_chunked_body(const uint8_t *payload, uint32_t payload_len,
+                                            char *dst, uint32_t dst_offset, uint32_t dst_max)
+{
+	int header_end = -1;
+	for (int i = 0; i < (int)payload_len - 3 && i < 2048; i++) {
+		if (payload[i] == '\r' && payload[i+1] == '\n' &&
+		    payload[i+2] == '\r' && payload[i+3] == '\n') {
+			header_end = i + 4;
+			break;
+		}
+	}
+	if (header_end < 0) return 0;
+
+	int pos = header_end;
+	int total = 0;
+	int remaining = (int)payload_len;
+
+	while (pos < remaining) {
+		int hex_consumed = 0;
+		int chunk_size = parse_hex(payload + pos, remaining - pos, &hex_consumed);
+		if (hex_consumed == 0) break;
+		pos += hex_consumed;
+
+		if (pos + 1 < remaining && payload[pos] == '\r' && payload[pos+1] == '\n')
+			pos += 2;
+		else
+			break;
+
+		if (chunk_size == 0) break;
+
+		int copy_len = chunk_size;
+		if ((uint32_t)(dst_offset + total + copy_len) >= dst_max)
+			copy_len = dst_max - dst_offset - total - 1;
+		if (copy_len <= 0) break;
+
+		for (int i = 0; i < copy_len && pos + i < remaining; i++)
+			dst[dst_offset + total + i] = (char)payload[pos + i];
+		total += copy_len;
+		pos += chunk_size;
+
+		if (pos + 1 < remaining && payload[pos] == '\r' && payload[pos+1] == '\n')
+			pos += 2;
+	}
+
+	if (total > 0)
+		dst[dst_offset + total] = '\0';
+	return total;
+}
+
 static __device__ void publish_slot(struct inference_ring_buffer *ring, int slot_idx)
 {
 	struct inference_ring_slot *slot = &ring->slots[slot_idx];
@@ -437,6 +522,9 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 
 						int blen = extract_post_body(payload, payload_len,
 						                             slot->data, 0, sizeof(slot->data) - 1);
+						if (blen == 0 && is_chunked_encoding(payload, payload_len))
+							blen = extract_chunked_body(payload, payload_len,
+							                            slot->data, 0, sizeof(slot->data) - 1);
 						if (blen > 0) {
 							slot->len = blen;
 							slot->record_count = 1;
