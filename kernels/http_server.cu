@@ -10,6 +10,7 @@
 #include <doca_gpunetio_dev_buf.cuh>
 #include <doca_gpunetio_dev_sem.cuh>
 #include <doca_gpunetio_dev_eth_txq.cuh>
+#include "doca33_compat.cuh"  /* DOCA33-COMPAT: build only */
 
 /* Global Atomic Counter for TX Buffer Allocation
  * Used for atomic allocation of TX buffer index across all warps to avoid race conditions
@@ -20,6 +21,7 @@ __device__ unsigned long long g_tx_buf_counter = 0;
 #include "packets.h"
 #include "filters.cuh"
 #include "ring_buffer.h"  /* Ring Buffer UVM */
+#include "slot_claim.h"   /* Queue-entry -> slot ownership rules */
 
 /* HTTP Response Buffer Layout Constants */
 #define HTTP_BODY_TEMP_OFFSET  256  /* Temporary offset for body construction */
@@ -29,6 +31,12 @@ __device__ unsigned long long g_tx_buf_counter = 0;
 #define HTTP_RESP_PREFIX_LEN 65
 #define HTTP_RESP_SUFFIX "\r\nConnection: keep-alive\r\n\r\n"
 #define HTTP_RESP_SUFFIX_LEN 28
+#define HTTP_ERR_BODY "{\"error\":\"no result\"}"
+#define HTTP_ERR_BODY_LEN 21
+
+/* Keep the compat layer's send bound in step with the real TX buffer size */
+static_assert(GAZSI_TX_SEND_MAX == TX_BUF_MAX_SZ,
+	      "GAZSI_TX_SEND_MAX must match TX_BUF_MAX_SZ");
 
 /* Warp-level parallel memcpy - each lane copies dst[lane_id], dst[lane_id+32], ... */
 __device__ static inline void warp_memcpy(char *dst, const char *src, int len, int lane_id)
@@ -69,8 +77,11 @@ __device__ static inline int int_to_str(char *buf, int value)
 	return num_digits;
 }
 
-/* Global UVM buffer pointer */
+/* Global control-plane pointer (host-mapped) */
 __device__ struct inference_ring_buffer *g_inference_ring_buf = nullptr;
+
+/* Global data-plane pointer (device memory only) */
+__device__ struct inference_payload_plane *g_payload_plane = nullptr;
 
 /* Global semaphore handle for CPU -> GPU notification */
 __device__ struct doca_gpu_semaphore_gpu *g_sem_inference_gpu = nullptr;
@@ -84,6 +95,15 @@ __global__ void set_inference_ring_buffer(struct inference_ring_buffer *ring)
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         g_inference_ring_buf = ring;
         printf("[RING_INIT] Ring Buffer set: %p\n", ring);
+    }
+}
+
+/* Set device payload plane pointer - called from CPU */
+__global__ void set_payload_plane(struct inference_payload_plane *plane)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        g_payload_plane = plane;
+        printf("[RING_INIT] Device payload plane set: %p\n", plane);
     }
 }
 
@@ -174,17 +194,20 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 
 			/* Claim slot: CAS RESULT_READY → CONSUMED (safety check) */
 			{
-				uint32_t old_val = 0;
-				if (lane_id == 0) {
-					uint32_t expected = UVM_STATUS_RESULT_READY;
-					old_val = atomicCAS((unsigned int*)&current_slot->ready, expected, UVM_STATUS_CONSUMED);
-				}
-				old_val = __shfl_sync(0xffffffff, old_val, 0);
+				uint32_t claimed = 0;
+				if (lane_id == 0)
+					claimed = gazsi_tx_claim_slot(g_inference_ring_buf, slot_idx) ? 1u : 0u;
+				claimed = __shfl_sync(0xffffffff, claimed, 0);
 
-				if (old_val != UVM_STATUS_RESULT_READY) {
-					/* Shouldn't happen with queue dispatch — return slot to free_pool */
-					if (lane_id == 0)
-						gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
+				if (!claimed) {
+					/*
+					 * Stale response_queue entry: the slot is owned
+					 * by someone else now. Drop the entry and take
+					 * the next one. Pushing it to free_pool would
+					 * publish a slot this warp does not own, and the
+					 * real owner will publish it too — the same index
+					 * would then be handed to two requests.
+					 */
 					__syncwarp();
 					continue;
 				}
@@ -199,6 +222,13 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				doca_gpu_buf_idx = __shfl_sync(0xffffffff, doca_gpu_buf_idx, 0);
 
 				enum http_page_get page_type = (enum http_page_get)current_slot->http_page_type;
+
+				/*
+				 * Any buffer or send failure must be propagated, not swallowed:
+				 * the slot must NOT be recycled after a failed transmission, or it
+				 * could be reused while a send referring to it is still outstanding.
+				 */
+				bool tx_failed = false;
 
 				if (page_type == HTTP_GET_INDEX) {
 					ret = doca_gpu_dev_buf_get_buf(buf_arr_gpu_page_index, doca_gpu_buf_idx, &buf);
@@ -245,51 +275,66 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 					uint32_t nrec = current_slot->record_count;
 					if (nrec == 0) nrec = 1;
 
+					/*
+					 * Response bytes live in device memory. resp_length is
+					 * written by the GPU format kernel for every record of a
+					 * claimed slot, so no fallback to slot->len is needed.
+					 */
+					struct inference_payload_slot *pay =
+						(g_payload_plane != nullptr) ? &g_payload_plane->slots[slot_idx] : nullptr;
+
 					for (uint32_t rec = 0; rec < nrec; rec++) {
-						uint32_t rec_off = current_slot->directory[rec].offset;
-						uint32_t rec_len = current_slot->directory[rec].length;
-						if (rec_len == 0 && rec == 0) rec_len = current_slot->len;
+						uint32_t rec_len = (pay != nullptr)
+							? current_slot->directory[rec].resp_length : 0;
 
 						if (rec > 0) {
 							if (lane_id == 0)
 								doca_gpu_buf_idx = atomicAdd(&g_tx_buf_counter, 1ULL) % TX_BUF_NUM;
 							doca_gpu_buf_idx = __shfl_sync(0xffffffff, doca_gpu_buf_idx, 0);
 							ret = doca_gpu_dev_buf_get_buf(buf_arr_gpu_page_index, doca_gpu_buf_idx, &buf);
-							if (ret != DOCA_SUCCESS) break;
+							if (ret != DOCA_SUCCESS) { tx_failed = true; break; }
 							ret = doca_gpu_dev_buf_get_addr(buf, &buf_addr);
-							if (ret != DOCA_SUCCESS) break;
+							if (ret != DOCA_SUCCESS) { tx_failed = true; break; }
 						}
 
 						char *response_buf = (char *)(buf_addr + base_pkt_len);
 						int body_len = 0;
 						int header_len = 0;
+						int have_body = 0;
 
 						if (lane_id == 0) {
 							if (rec == 0) current_slot->t8_gpu_sent = clock64();
 							header_len = HTTP_RESP_PREFIX_LEN;
 							body_len = (int)rec_len;
-							if (body_len <= 0 || body_len > HTTP_BODY_MAX_LEN) {
-								const char err[] = "{\"error\":\"no result\"}";
-								body_len = sizeof(err) - 1;
-								header_len += int_to_str(response_buf + header_len, body_len);
-								int bo = header_len + HTTP_RESP_SUFFIX_LEN;
-								for (int k = 0; k < body_len; k++)
-									response_buf[bo + k] = err[k];
-							} else {
-								header_len += int_to_str(response_buf + header_len, body_len);
-							}
+							have_body = (body_len > 0 && body_len <= HTTP_BODY_MAX_LEN);
+							if (!have_body)
+								body_len = HTTP_ERR_BODY_LEN;
+							header_len += int_to_str(response_buf + header_len, body_len);
 							nbytes_page = header_len + HTTP_RESP_SUFFIX_LEN + body_len;
 						}
 
 						header_len = __shfl_sync(0xffffffff, header_len, 0);
 						body_len = __shfl_sync(0xffffffff, body_len, 0);
+						have_body = __shfl_sync(0xffffffff, have_body, 0);
 						nbytes_page = __shfl_sync(0xffffffff, nbytes_page, 0);
 
 						warp_memcpy(response_buf, HTTP_RESP_PREFIX, HTTP_RESP_PREFIX_LEN, lane_id);
 						__syncwarp();
 						warp_memcpy(response_buf + header_len, HTTP_RESP_SUFFIX, HTTP_RESP_SUFFIX_LEN, lane_id);
 						int bo = header_len + HTTP_RESP_SUFFIX_LEN;
-						warp_memcpy(response_buf + bo, current_slot->data + rec_off, body_len, lane_id);
+						if (have_body) {
+							/* Device-to-device: response arena -> TX packet buffer */
+							warp_memcpy(response_buf + bo,
+								    pay->response + rec * GAZSI_RESPONSE_STRIDE,
+								    body_len, lane_id);
+						} else {
+							/*
+							 * Write the error body last. The previous ordering
+							 * emitted it before the body copy, which then
+							 * overwrote it with unformatted bytes.
+							 */
+							warp_memcpy(response_buf + bo, HTTP_ERR_BODY, HTTP_ERR_BODY_LEN, lane_id);
+						}
 
 						raw_to_tcp(buf_addr, &hdr, &payload);
 						http_set_mac_addr(hdr, (uint16_t *)current_slot->eth_src_addr_bytes, (uint16_t *)current_slot->eth_dst_addr_bytes);
@@ -341,10 +386,18 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 						hdr->l3_hdr.total_length = BYTE_SWAP16(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + nbytes_page);
 						hdr->l3_hdr.hdr_checksum = 0;
 
+						uint32_t send_bad = 0;
 						if (lane_id == 0) {
 							ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
-							send_pkts++;
+							if (ret != DOCA_SUCCESS) {
+								printf("Error %d send_enqueue (inference) warp %d\n", ret, warp_id);
+								send_bad = 1;
+							} else {
+								send_pkts++;
+							}
 						}
+						send_bad = __shfl_sync(0xffffffff, send_bad, 0);
+						if (send_bad) { tx_failed = true; break; }
 						__syncwarp();
 
 						if (rec + 1 < nrec) {
@@ -370,24 +423,45 @@ __global__ void cuda_kernel_http_server(uint32_t *exit_cond,
 				hdr->l3_hdr.total_length = BYTE_SWAP16(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + nbytes_page);
 				hdr->l3_hdr.hdr_checksum = 0;
 
+				uint32_t send_bad2 = 0;
 				if (lane_id == 0) {
 					ret = doca_gpu_dev_eth_txq_send_enqueue_strong(txq, buf, base_pkt_len + nbytes_page, 0);
 					if (ret != DOCA_SUCCESS) {
 						printf("Error %d doca_gpu_dev_eth_txq_send_enqueue_strong block %d thread %d\n", ret, warp_id, lane_id);
 						DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
+						send_bad2 = 1;
+					} else {
+						send_pkts++;
 					}
-					send_pkts++;
 				}
+				send_bad2 = __shfl_sync(0xffffffff, send_bad2, 0);
+				if (send_bad2)
+					tx_failed = true;
 				__syncwarp();
 				}
 
-				{
-					cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
-						ready_ref(*(uint32_t*)&current_slot->ready);
-					ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
+				/*
+				 * Recycle only on success. After a failed transmission the slot
+				 * stays CONSUMED and is deliberately NOT returned to the free
+				 * pool, and the kernel asks the app to exit: reuse could race a
+				 * send that may still be in flight. Losing a bounded number of
+				 * slots beats corrupting one.
+				 */
+				if (tx_failed) {
+					if (lane_id == 0) {
+						printf("TX failed slot %d: not recycling, requesting exit\n", slot_idx);
+						DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
+					}
+					__syncwarp();
+				} else {
+					{
+						cuda::atomic_ref<uint32_t, cuda::thread_scope_system>
+							ready_ref(*(uint32_t*)&current_slot->ready);
+						ready_ref.store(UVM_STATUS_FREE, cuda::memory_order_release);
+					}
+					if (lane_id == 0)
+						gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
 				}
-				if (lane_id == 0)
-					gpu_iq_push(&g_inference_ring_buf->free_pool, slot_idx);
 			}
 		}
 		__syncwarp();
@@ -470,6 +544,38 @@ doca_error_t set_inference_ring_buffer_kernel(cudaStream_t stream, struct infere
 	}
 
 	/* Synchronize to ensure kernel completion */
+	result = cudaStreamSynchronize(stream);
+	if (cudaSuccess != result) {
+		DOCA_LOG_ERR("[%s:%d] cuda sync failed with %s \n", __FILE__, __LINE__, cudaGetErrorString(result));
+		return DOCA_ERROR_BAD_STATE;
+	}
+
+	return DOCA_SUCCESS;
+}
+
+/* Publish the device payload plane pointer to the GPU kernels */
+doca_error_t set_payload_plane_kernel(cudaStream_t stream, struct inference_payload_plane *plane)
+{
+	cudaError_t result = cudaSuccess;
+
+	if (plane == NULL) {
+		DOCA_LOG_ERR("set_payload_plane_kernel invalid input");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	result = cudaGetLastError();
+	if (cudaSuccess != result) {
+		DOCA_LOG_ERR("[%s:%d] cuda failed with %s \n", __FILE__, __LINE__, cudaGetErrorString(result));
+		return DOCA_ERROR_BAD_STATE;
+	}
+
+	set_payload_plane<<<1, 1, 0, stream>>>(plane);
+	result = cudaGetLastError();
+	if (cudaSuccess != result) {
+		DOCA_LOG_ERR("[%s:%d] cuda failed with %s \n", __FILE__, __LINE__, cudaGetErrorString(result));
+		return DOCA_ERROR_BAD_STATE;
+	}
+
 	result = cudaStreamSynchronize(stream);
 	if (cudaSuccess != result) {
 		DOCA_LOG_ERR("[%s:%d] cuda sync failed with %s \n", __FILE__, __LINE__, cudaGetErrorString(result));

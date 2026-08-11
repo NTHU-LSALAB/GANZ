@@ -8,6 +8,7 @@
 #include <doca_flow.h>
 
 #include "common.h"
+#include "doca33_compat.h"
 #include "tcp/session.h"
 
 DOCA_LOG_REGISTER(GPUNET_FLOW);
@@ -202,11 +203,15 @@ doca_error_t create_tcp_cpu_pipe(struct rxq_tcp_queues *tcp_queues, struct doca_
 	for (int idx = 0; idx < tcp_queues->numq_cpu_rss; idx++)
 		rss_queues[idx] = idx;
 
+	/* DOCA33-COMPAT: RSS fields moved into a nested rss sub-struct in DOCA 3.3 */
 	struct doca_flow_fwd fwd = {
 		.type = DOCA_FLOW_FWD_RSS,
-		.rss_outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_TCP,
-		.rss_queues = rss_queues,
-		.num_of_queues = tcp_queues->numq_cpu_rss,
+		.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED,
+		.rss = {
+			.outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_TCP,
+			.queues_array = rss_queues,
+			.nr_queues = tcp_queues->numq_cpu_rss,
+		},
 	};
 
 	struct doca_flow_fwd miss_fwd = {
@@ -357,11 +362,15 @@ doca_error_t create_tcp_gpu_pipe(struct rxq_tcp_queues *tcp_queues,
 		rss_queues[idx] = flow_queue_id;
 	}
 
+	/* DOCA33-COMPAT: RSS fields moved into a nested rss sub-struct in DOCA 3.3 */
 	struct doca_flow_fwd fwd = {
 		.type = DOCA_FLOW_FWD_RSS,
-		.rss_outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_TCP,
-		.rss_queues = rss_queues,
-		.num_of_queues = tcp_queues->numq,
+		.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED,
+		.rss = {
+			.outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_TCP,
+			.queues_array = rss_queues,
+			.nr_queues = tcp_queues->numq,
+		},
 	};
 
 	struct doca_flow_fwd miss_fwd = {

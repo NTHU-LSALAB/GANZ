@@ -347,6 +347,15 @@ doca_error_t kernel_http_server(cudaStream_t stream,
 doca_error_t set_inference_ring_buffer_kernel(cudaStream_t stream, struct inference_ring_buffer *ring);
 
 /*
+ * Publish the device-resident payload plane pointer to the GPU kernels.
+ *
+ * @stream [in]: CUDA stream
+ * @plane [in]: device payload plane pointer
+ * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
+ */
+doca_error_t set_payload_plane_kernel(cudaStream_t stream, struct inference_payload_plane *plane);
+
+/*
  * Set inference semaphore GPU handle
  *
  * @stream [in]: CUDA stream

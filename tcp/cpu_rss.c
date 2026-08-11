@@ -4,6 +4,7 @@
  */
 
 #include "cpu_rss.h"
+#include "doca33_compat.h"  /* DOCA33-COMPAT: build only */
 #include "session.h"
 
 DOCA_LOG_REGISTER(TCP_CPU_RSS);
@@ -66,20 +67,22 @@ int tcp_cpu_rss_func(void *lcore_args)
 				continue;
 			}
 
-			if (!tcp_hdr->syn && !tcp_hdr->fin && !tcp_hdr->rst) {
+			if (!(tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) &&
+			    !(tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG) &&
+			    !(tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG)) {
 				DOCA_LOG_WARN("Unexpected TCP packet flags: 0x%x, expected SYN/RST/FIN",
 					      tcp_hdr->tcp_flags);
 				continue;
 			}
 
-			if (tcp_hdr->rst) {
+			if (tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG) {
 				log_tcp_flag(pkt, "RST");
 				destroy_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->ring);
 				continue; // Do not bother to ack
-			} else if (tcp_hdr->fin) {
+			} else if (tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG) {
 				log_tcp_flag(pkt, "FIN");
 				destroy_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->ring);
-			} else if (tcp_hdr->syn) {
+			} else if (tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) {
 				log_tcp_flag(pkt, "SYN");
 				result = create_tcp_session(queue_id, pkt, tcp_queues->port, tcp_queues->rxq_pipe_gpu, tcp_queues->ring);
 				if (result != DOCA_SUCCESS)
@@ -245,7 +248,7 @@ struct rte_mbuf *create_ack_packet(const struct rte_mbuf *src_packet, struct rte
 	const struct rte_ipv4_hdr *src_ipv4_hdr = (struct rte_ipv4_hdr *)&src_eth_hdr[1];
 	const struct rte_tcp_hdr *src_tcp_hdr = (struct rte_tcp_hdr *)&src_ipv4_hdr[1];
 
-	if (!src_tcp_hdr->syn) {
+	if (!(src_tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG)) {
 		/* Do not bother with TCP options unless responding to SYN */
 		tcp_option_array_len = 0;
 	}
@@ -285,15 +288,29 @@ struct rte_mbuf *create_ack_packet(const struct rte_mbuf *src_packet, struct rte
 	dst_tcp_hdr->src_port = src_tcp_hdr->dst_port;
 	dst_tcp_hdr->dst_port = src_tcp_hdr->src_port;
 	dst_tcp_hdr->recv_ack = RTE_BE32(RTE_BE32(src_tcp_hdr->sent_seq) + 1);
-	dst_tcp_hdr->sent_seq = src_tcp_hdr->syn ? RTE_BE32(1000) : src_tcp_hdr->recv_ack;
+	dst_tcp_hdr->sent_seq = (src_tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) ? RTE_BE32(1000) : src_tcp_hdr->recv_ack;
 	dst_tcp_hdr->rx_win = RTE_BE16(60000);
-	dst_tcp_hdr->dt_off = 5 + tcp_option_array_len / 4;
+	/*
+	 * DOCA33-COMPAT: data_off carries the header length in its HIGH nibble
+	 * (low nibble is reserved), so the word count must be shifted. The old
+	 * bitfield member assigned the offset field directly.
+	 */
+	dst_tcp_hdr->data_off = (uint8_t)((5 + tcp_option_array_len / 4) << 4);
 
-	if (!src_tcp_hdr->ack) {
-		dst_tcp_hdr->syn = src_tcp_hdr->syn;
-		dst_tcp_hdr->fin = src_tcp_hdr->fin;
+	/*
+	 * DOCA33-COMPAT: rte_tcp_hdr lost its per-flag bitfields. Build the flag
+	 * byte from scratch — this is a freshly constructed response header, so
+	 * OR-ing onto its existing contents would carry over whatever was in the
+	 * reused mbuf.
+	 */
+	{
+		uint8_t flags = RTE_TCP_ACK_FLAG;
+
+		if (!(src_tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG))
+			flags |= src_tcp_hdr->tcp_flags & (RTE_TCP_SYN_FLAG | RTE_TCP_FIN_FLAG);
+
+		dst_tcp_hdr->tcp_flags = flags;
 	}
-	dst_tcp_hdr->ack = 1;
 
 	if (tcp_option_array_len) {
 		uint8_t *mss_opt = dst_tcp_opts;

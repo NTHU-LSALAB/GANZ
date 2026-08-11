@@ -1,0 +1,6 @@
+# Built test artifacts
+test_gpu_pipeline
+bench_dataplane
+test_tcp_hdr
+test_slot_claim
+ab_results/

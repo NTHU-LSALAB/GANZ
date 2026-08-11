@@ -2,13 +2,59 @@
  * GPU Packet Processing - Improved Inference Ring Buffer Header
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Lock-free ring buffer for CPU-GPU inference data exchange
+ * Split-plane ring buffer for CPU-GPU inference coordination.
+ *
+ * TWO PLANES, ONE SLOT INDEX
+ * ==========================
+ *
+ *   Control plane (struct inference_ring_slot)
+ *       Host-mapped pinned memory (cudaHostAllocMapped). Holds ONLY metadata:
+ *       ownership state, record directory (offsets/lengths), TCP routing
+ *       context and profiling timestamps. The host reads and writes this
+ *       plane because it must know which slots to launch work for.
+ *
+ *   Data plane (struct inference_payload_slot)
+ *       Device-only memory (cudaMalloc). Holds request bytes parsed out of
+ *       the NIC packet and the response bytes assembled for transmission.
+ *       ONLY GPU kernels ever dereference this plane.
+ *
+ * INVARIANT: no request or result payload byte is ever read, written, copied,
+ * tokenized or formatted by the CPU. There is deliberately no host-side
+ * accessor for the data plane — the absence of one is what enforces this.
+ * Payload lives in device memory from NIC ingress through HTTP parsing,
+ * tokenization, TensorRT inference, result formatting and response assembly.
+ *
+ * PUBLICATION ORDERING (system scope)
+ * ===================================
+ * Because payload and control now live in different memories, every handoff
+ * publishes the data plane BEFORE the control plane, and every consumer
+ * acquires the control plane before touching the data plane:
+ *
+ *   GPU RX  : store request bytes (device) -> release-store ready=PARAM_READY
+ *             (thread_scope_system) -> release-push request_queue
+ *   Host    : acquire-CAS ready PARAM_READY->PROCESSING. The acquire
+ *             synchronises-with the GPU release, so the payload writes
+ *             happen-before the host's subsequent kernel launches, and
+ *             therefore happen-before those kernels' reads.
+ *   GPU     : tokenize -> enqueueV3 -> format, all ordered on one CUDA stream.
+ *   Host    : cudaStreamSynchronize (the format kernel's device writes are
+ *             now visible device-wide) -> release-store ready=RESULT_READY
+ *             -> release-push response_queue. The sync MUST precede the
+ *             release-store, otherwise TX could read a half-written response.
+ *   GPU TX  : acquire-pop response_queue -> acquire-CAS ready -> read response
+ *             bytes (device) -> assemble packet.
  */
 
 #ifndef IMPROVED_INFERENCE_UVM_H
 #define IMPROVED_INFERENCE_UVM_H
 
 #include <stdint.h>
+
+#if defined(__cplusplus)
+#define GAZSI_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define GAZSI_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
 
 /* Ring Buffer size - 128 performs better than 256 in testing */
 #define INFERENCE_RING_SIZE 256
@@ -25,15 +71,53 @@
 #define UVM_STATUS_CONSUMED     4  /* GPU has read result */
 
 /*
- * Record Directory entry — describes one request within a packed slot
+ * Record Directory entry — describes one request within a packed slot.
+ *
+ * offset/length address the request bytes inside the slot's device-resident
+ * request[] buffer. resp_length is the formatted response length written by
+ * the GPU format kernel; the response offset is not stored because it is
+ * always rec * GAZSI_RESPONSE_STRIDE — a fixed stride removes the
+ * "where does record N's response start" special case entirely, and stops
+ * record N's response from ever overwriting record N+1's request text.
  */
 #define MAX_RECORDS_PER_SLOT 4
 
 struct record_entry {
     uint32_t offset;
     uint32_t length;
+    uint32_t resp_length;
     uint32_t tcp_sent_seq;
     uint32_t tcp_recv_ack;
+    uint32_t _pad;
+};
+
+GAZSI_STATIC_ASSERT(sizeof(struct record_entry) == 24, "record_entry must stay 24B");
+
+/*
+ * Data plane geometry.
+ *
+ * GAZSI_REQUEST_BYTES  : request text arena per slot (all packed records)
+ * GAZSI_RESPONSE_STRIDE: fixed per-record response arena
+ * GAZSI_RESPONSE_MAX   : longest response the GPU formatter may emit. Must
+ *                        stay <= HTTP_BODY_MAX_LEN in the TX kernel, else TX
+ *                        would replace the body with its error JSON.
+ * GAZSI_TOKENIZE_MAX   : request bytes fed to the tokenizer. Matches the
+ *                        512-byte clamp the CPU path used, so token streams
+ *                        (and therefore model outputs) are unchanged.
+ */
+#define GAZSI_REQUEST_BYTES    896
+#define GAZSI_RESPONSE_STRIDE  1024
+#define GAZSI_RESPONSE_MAX     900
+#define GAZSI_TOKENIZE_MAX     512
+
+/* Device-only payload slot. Never dereferenced by host code. */
+struct inference_payload_slot {
+    char request[GAZSI_REQUEST_BYTES];
+    char response[MAX_RECORDS_PER_SLOT * GAZSI_RESPONSE_STRIDE];
+};
+
+struct inference_payload_plane {
+    struct inference_payload_slot slots[INFERENCE_RING_SIZE];
 };
 
 #define GPU_CONN_TABLE_SIZE 256
@@ -53,7 +137,12 @@ struct gpu_conn_state {
 };
 
 /*
- * Ring Buffer slot structure
+ * Ring Buffer slot structure — CONTROL PLANE ONLY (host-mapped).
+ *
+ * Deliberately carries no payload bytes. Shrinking the slot from 1152B to
+ * 256B also shrinks every host-mapped metadata access the GPU makes over
+ * PCIe by the same factor.
+ *
  * Cache-line aligned: Control Header + Record Directory in first cache line
  */
 struct inference_ring_slot {
@@ -61,10 +150,10 @@ struct inference_ring_slot {
     volatile uint32_t ready;           /* 4B: Ownership state */
     volatile uint32_t record_count;    /* 4B: Number of records packed in slot */
     volatile uint64_t request_id;      /* 8B: Request ID (first record) */
-    volatile uint32_t len;             /* 4B: Total payload bytes across all records */
+    volatile uint32_t len;             /* 4B: Total request bytes across all records */
     uint32_t _pad_ctrl;                /* 4B: alignment */
-    struct record_entry directory[MAX_RECORDS_PER_SLOT]; /* 64B: Record Directory */
-    char _pad_dir[40];                 /* 40B: pad to 128 bytes */
+    struct record_entry directory[MAX_RECORDS_PER_SLOT]; /* 96B: Record Directory */
+    char _pad_dir[8];                  /* 8B: pad to 128 bytes */
 
     /* TCP Routing Context (40 bytes) — shared by all records (same connection) */
     uint8_t eth_src_addr_bytes[6];     /* Ethernet source address */
@@ -92,10 +181,15 @@ struct inference_ring_slot {
     volatile uint64_t t7_gpu_read;       /* T7: GPU detected result */
     volatile uint64_t t8_gpu_sent;       /* T8: GPU sent HTTP response */
 
-    /* Data Buffer — holds packed payloads for all records */
-    char data[856];                    /* Payload buffer */
-    char padding2[48];                 /* Pad to 1152 bytes (9 cache lines) */
+    /*
+     * No payload buffer here by design. Request and response bytes live in
+     * the device-resident inference_payload_plane at the same slot index.
+     */
+    char _pad_tail[8];                 /* Pad to 256 bytes (2 cache lines) */
 } __attribute__((aligned(128)));
+
+GAZSI_STATIC_ASSERT(sizeof(struct inference_ring_slot) == 256,
+                    "control slot must stay 256B (2 cache lines)");
 
 /*
  * Lock-free SPSC/MPSC index queue (Q2 optimization)
@@ -160,6 +254,12 @@ struct inference_ring_buffer {
     struct clock_sync_info clock_sync;
 };
 
+/*
+ * Host-side queue primitives. Header-only so that the slot ownership rules in
+ * slot_claim.h can be built without CUDA or DOCA.
+ */
+#include "index_queue.h"
+
 /* Forward declaration for DOCA types */
 struct doca_gpu_semaphore;
 struct doca_gpu_semaphore_gpu;
@@ -187,19 +287,30 @@ struct doca_gpu_semaphore* get_request_semaphore_cpu(void);
 /* Free Ring Buffer */
 void free_inference_ring_buffer(struct inference_ring_buffer *ring);
 
-/* CPU-side write processing result to GPU ring. Returns 1 on success, 0 on failure */
-int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gpu, uint32_t slot_index, const char *result);
+/*
+ * Device pointer to the payload data plane, for passing to CUDA kernels.
+ *
+ * There is intentionally NO host-mapped counterpart: this pointer is only
+ * ever valid inside device code. Dereferencing it on the host is a
+ * segmentation fault, which is exactly the guard rail we want.
+ */
+struct inference_payload_plane *get_payload_plane_device(void);
 
-/* Host-side slot data accessors (for cudaMemcpyAsync source) */
-const char *get_slot_data_host(uint32_t slot_index);
-uint32_t get_slot_len_host(uint32_t slot_index);
+/*
+ * Publish a device-formatted result for a slot: mark RESULT_READY and hand
+ * the slot to the GPU TX kernel.
+ *
+ * Caller MUST have synchronised the stream that ran the format kernel first,
+ * so the response bytes are visible device-wide before TX can observe the
+ * state change. Touches control metadata only.
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+int publish_inference_result(struct inference_ring_buffer *ring_gpu, uint32_t slot_index);
 
 /* GPU-side slot allocation. Returns slot index, -1 if ring buffer is full */
 #ifdef __CUDACC__
 __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t *request_id);
-
-/* GPU-side store inference data to slot */
-__device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *ring, int slot_index, const char *data);
 
 /* GPU-side FIFO queue operations (thread_scope_system atomics) */
 __device__ int  gpu_iq_pop(struct index_queue *q);
@@ -207,9 +318,7 @@ __device__ void gpu_iq_push(struct index_queue *q, int value);
 
 #endif
 
-/* CPU-side FIFO queue operations (__atomic_* builtins) */
-int  cpu_iq_pop(struct index_queue *q);
-void cpu_iq_push(struct index_queue *q, int value);
+/* CPU-side FIFO queue operations live in index_queue.h (static inline). */
 
 #ifdef __cplusplus
 }

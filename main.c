@@ -12,41 +12,21 @@
 #include "tcp/session.h"
 #include "tcp/cpu_rss.h"
 #include "inference/tensorrt.h"
-#include "inference/ring_buffer.h"  /* Ring Buffer UVM - supports concurrency */
+#include "inference/ring_buffer.h"  /* Split-plane ring buffer */
+#include "inference/slot_claim.h"   /* Queue-entry -> slot ownership rules */
+#include "inference/gpu_pipeline.h" /* Device-resident tokenize/format kernels */
 #include <pthread.h>
-#include <ctype.h>
 #define SLEEP_IN_NANOS (10 * 1000) /* Sample the PE every 10 microseconds  */
 
-/* Buffer and inference constants */
-#define DATA_BUFFER_SIZE     1024    /* Max size for inference data buffer */
-#define MAX_EMBEDDING_DIM    4096    /* Max output embedding dimension (alloc size) */
-#define MAX_DATA_LEN         855     /* Maximum valid data length (slot->data is 856 bytes, -1 for '\0') */
+/* Inference constants */
+#define MAX_DATA_LEN         (GAZSI_REQUEST_BYTES - 1) /* Max valid request length */
 #define SPIN_ITERATIONS      500
 
 /*
- * URL decode function - converts %XX encoding back to original characters
- * Example: %20 -> space, %2B -> +
+ * No URL decoding here: percent-escapes and '+' are decoded by the GPU while
+ * the request is still in device memory (see extract_url_param in
+ * kernels/tcp_rx.cu). The CPU never sees a request byte.
  */
-static void url_decode(char *str) {
-    char *src = str;
-    char *dst = str;
-
-    while (*src) {
-        if (*src == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
-            /* Decode %XX */
-            char hex[3] = {src[1], src[2], '\0'};
-            *dst++ = (char)strtol(hex, NULL, 16);
-            src += 3;
-        } else if (*src == '+') {
-            /* '+' also represents space */
-            *dst++ = ' ';
-            src++;
-        } else {
-            *dst++ = *src++;
-        }
-    }
-    *dst = '\0';
-}
 
 DOCA_LOG_REGISTER(GPUNET);
 
@@ -107,21 +87,90 @@ static int g_fixed_batch = 0;          /* 0=EWMA adaptive (default), >0=fixed ba
 #define ADAPTIVE_COLD_ROUNDS   3
 
 /*
- * Collect PARAM_READY slots (non-blocking, using CAS atomic claim)
- * Returns the number of slots collected
+ * Batch collection.
  *
- * Zero-copy optimization: URL-decodes directly on slot->data (slot is in
- * PROCESSING state, CPU-owned) and returns pointers into the ring buffer.
- * Eliminates the per-request memcpy to a stack buffer.
+ * Reads control metadata only — ownership state and the record directory. It
+ * produces gazsi_batch_item descriptors (slot index, record index, request
+ * offset and length) that the GPU kernels use to find the payload. No request
+ * byte is dereferenced here, which is why there is no text pointer in sight.
  */
 static int g_use_scan = 0;
 static uint64_t g_collect_time_sum = 0;
 static uint64_t g_collect_count = 0;
 
+/*
+ * Append every record of an already-claimed slot to the batch.
+ *
+ * Slot must be in PROCESSING with pending_count already decremented.
+ *
+ * A slot joins a batch with all of its records or none: splitting one across
+ * two batches would publish RESULT_READY while some records had never been
+ * inferred, and TX would transmit unformatted bytes for them.
+ *
+ * Returns records appended (>0), 0 if the slot was dropped as malformed,
+ * or -1 if it did not fit and was handed back for the next batch.
+ */
+static int append_slot_records(struct inference_ring_buffer *ring, uint32_t idx,
+                               struct gazsi_batch_item *items, int room) {
+	struct inference_ring_slot *slot = &ring->slots[idx];
+	uint32_t data_len = slot->len;
+	uint32_t nrec = slot->record_count;
+
+	if (nrec == 0) nrec = 1;
+
+	if (data_len > MAX_DATA_LEN || nrec > MAX_RECORDS_PER_SLOT) {
+		DOCA_LOG_WARN("Slot %u malformed (len=%u nrec=%u), releasing", idx, data_len, nrec);
+		__atomic_store_n(&slot->ready, UVM_STATUS_FREE, __ATOMIC_RELEASE);
+		cpu_iq_push(&ring->free_pool, (int)idx);
+		return 0;
+	}
+
+	if ((int)nrec > room) {
+		__atomic_fetch_add(&ring->pending_count, 1, __ATOMIC_RELEASE);
+		__atomic_store_n(&slot->ready, UVM_STATUS_PARAM_READY, __ATOMIC_RELEASE);
+		cpu_iq_push(&ring->request_queue, (int)idx);
+		return -1;
+	}
+
+	slot->t3_cpu_read = get_timestamp_ns();
+
+	for (uint32_t r = 0; r < nrec; r++) {
+		uint32_t off = slot->directory[r].offset;
+		uint32_t rlen = slot->directory[r].length;
+
+		/* Single unpacked record: the directory may carry only the total */
+		if (rlen == 0 && r == 0) {
+			rlen = data_len;
+			off = 0;
+		}
+
+		/*
+		 * Reject, do not clamp. Clamping a bad extent invents a request
+		 * boundary and would hand the GPU a descriptor that addresses
+		 * bytes the parser never wrote. Comparisons are overflow-safe:
+		 * off is bounded first, then rlen against the remaining space, so
+		 * off + rlen is never formed.
+		 */
+		if (off >= GAZSI_REQUEST_BYTES ||
+		    rlen > (uint32_t)GAZSI_REQUEST_BYTES - off) {
+			DOCA_LOG_WARN("Slot %u record %u malformed (off=%u len=%u), releasing slot",
+				      idx, r, off, rlen);
+			__atomic_store_n(&slot->ready, UVM_STATUS_FREE, __ATOMIC_RELEASE);
+			cpu_iq_push(&ring->free_pool, (int)idx);
+			return 0;
+		}
+
+		items[r].slot_index = idx;
+		items[r].record_index = r;
+		items[r].req_offset = off;
+		items[r].req_length = rlen;
+	}
+
+	return (int)nrec;
+}
+
 static int collect_ready_slots(struct inference_ring_buffer *ring,
-                               uint32_t *batch_slots,
-                               uint32_t *batch_record_idx,
-                               const char **batch_texts,
+                               struct gazsi_batch_item *items,
                                int max_batch) {
 	if (__atomic_load_n(&ring->pending_count, __ATOMIC_ACQUIRE) == 0)
 		return 0;
@@ -134,84 +183,38 @@ static int collect_ready_slots(struct inference_ring_buffer *ring,
 
 		for (int i = 0; i < INFERENCE_RING_SIZE && count < max_batch; i++) {
 			uint32_t expected = UVM_STATUS_PARAM_READY;
-			if (__atomic_compare_exchange_n(&ring->slots[i].ready,
-			                                &expected, UVM_STATUS_PROCESSING,
-			                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-				__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
-				int idx = i;
-				struct inference_ring_slot *slot = &ring->slots[idx];
-				uint32_t data_len = slot->len;
-				if (data_len > MAX_DATA_LEN) {
-					__atomic_store_n(&slot->ready, UVM_STATUS_FREE, __ATOMIC_RELEASE);
-					cpu_iq_push(&ring->free_pool, idx);
-					continue;
-				}
-				slot->data[data_len] = '\0';
-				url_decode(slot->data);
-				if (strlen(slot->data) > 512) slot->data[512] = '\0';
-				batch_slots[count] = (uint32_t)idx;
-				batch_record_idx[count] = 0;
-				batch_texts[count] = slot->data;
-				slot->t3_cpu_read = get_timestamp_ns();
-				count++;
-			}
+			if (!__atomic_compare_exchange_n(&ring->slots[i].ready,
+			                                 &expected, UVM_STATUS_PROCESSING,
+			                                 false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+				continue;
+
+			__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
+
+			int added = append_slot_records(ring, (uint32_t)i, &items[count],
+			                               max_batch - count);
+			if (added < 0)
+				break;
+			count += added;
 		}
-		uint64_t elapsed = get_timestamp_ns() - t_start;
-		g_collect_time_sum += elapsed;
-		g_collect_count++;
-		return count;
-	}
+	} else {
+		while (count < max_batch) {
+			/*
+			 * Claiming is the CAS, not the pop. A stale queue entry
+			 * is dropped inside the helper and never handed to
+			 * free_pool: publishing a slot this thread does not own
+			 * would let two requests share one slot.
+			 */
+			int idx = gazsi_claim_request_slot(ring);
+			if (idx < 0)
+				break;
 
-	while (count < max_batch) {
-		int idx = cpu_iq_pop(&ring->request_queue);
-		if (idx < 0)
-			break;
+			__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
 
-		struct inference_ring_slot *slot = &ring->slots[idx];
-
-		uint32_t expected = UVM_STATUS_PARAM_READY;
-		if (!__atomic_compare_exchange_n(&slot->ready,
-		                                  &expected,
-		                                  UVM_STATUS_PROCESSING,
-		                                  false,
-		                                  __ATOMIC_ACQ_REL,
-		                                  __ATOMIC_ACQUIRE)) {
-			/* Shouldn't happen — slot came from request_queue.
-			 * Return to free_pool as safety fallback. */
-			cpu_iq_push(&ring->free_pool, idx);
-			continue;
-		}
-
-		__atomic_fetch_sub(&ring->pending_count, 1, __ATOMIC_RELEASE);
-
-		uint32_t data_len = slot->len;
-		if (data_len > MAX_DATA_LEN) {
-			DOCA_LOG_WARN("Slot %u has invalid len=%u, resetting to FREE", (uint32_t)idx, data_len);
-			__atomic_store_n(&slot->ready, UVM_STATUS_FREE, __ATOMIC_RELEASE);
-			cpu_iq_push(&ring->free_pool, idx);
-			continue;
-		}
-
-		slot->t3_cpu_read = get_timestamp_ns();
-
-		uint32_t nrec = slot->record_count;
-		if (nrec == 0) nrec = 1;
-
-		for (uint32_t r = 0; r < nrec && count < max_batch; r++) {
-			uint32_t off = slot->directory[r].offset;
-			uint32_t rlen = slot->directory[r].length;
-			if (rlen == 0 && r == 0) {
-				rlen = data_len;
-				off = 0;
-			}
-			if (off + rlen > sizeof(slot->data)) continue;
-			slot->data[off + rlen] = '\0';
-			if (rlen > 512) slot->data[off + 512] = '\0';
-
-			batch_slots[count] = (uint32_t)idx;
-			batch_record_idx[count] = r;
-			batch_texts[count] = slot->data + off;
-			count++;
+			int added = append_slot_records(ring, (uint32_t)idx, &items[count],
+			                               max_batch - count);
+			if (added < 0)
+				break;
+			count += added;
 		}
 	}
 
@@ -247,14 +250,29 @@ void* simple_inference_reader(void* arg) {
 	cudaSetDevice(g_cuda_id);
 	DOCA_LOG_INFO("[ADAPTIVE] Thread %d: Using GPU %d for TensorRT", thread_id, g_cuda_id);
 
-	uint32_t batch_slots[BATCH_MAX_SIZE];
-	uint32_t batch_record_idx[BATCH_MAX_SIZE];
-	const char *batch_texts[BATCH_MAX_SIZE];
-	float batch_embeddings[BATCH_MAX_SIZE * MAX_EMBEDDING_DIM];
-	int batch_token_counts[BATCH_MAX_SIZE];
-	char result_buffer[DATA_BUFFER_SIZE];
+	/*
+	 * Batch descriptors, host-mapped so the GPU kernels can read them without
+	 * an explicit copy. These are pure metadata (slot/record index, offset,
+	 * length) — 16 bytes per record, no payload.
+	 *
+	 * There are deliberately no embedding, token-count or result buffers on
+	 * the host: those all live in device memory now.
+	 */
+	struct gazsi_batch_item *h_items = NULL;
+	struct gazsi_batch_item *d_items = NULL;
+	if (cudaHostAlloc((void **)&h_items, BATCH_MAX_SIZE * sizeof(*h_items),
+	                  cudaHostAllocMapped) != cudaSuccess ||
+	    cudaHostGetDevicePointer((void **)&d_items, h_items, 0) != cudaSuccess) {
+		DOCA_LOG_ERR("[ADAPTIVE] Thread %d: failed to allocate batch descriptors", thread_id);
+		return NULL;
+	}
 
-	struct timespec start_time, end_time;
+	struct inference_payload_plane *plane = get_payload_plane_device();
+	if (plane == NULL) {
+		DOCA_LOG_ERR("[ADAPTIVE] Thread %d: device payload plane unavailable", thread_id);
+		cudaFreeHost(h_items);
+		return NULL;
+	}
 
 	/* Adaptive batching state — all derived online, zero manual config */
 	double lambda_now = 0.0;
@@ -276,8 +294,7 @@ void* simple_inference_reader(void* arg) {
 			continue;
 		}
 
-		int batch_size = collect_ready_slots(g_inference_ring_buf, batch_slots,
-		                                      batch_record_idx, batch_texts, BATCH_MAX_SIZE);
+		int batch_size = collect_ready_slots(g_inference_ring_buf, h_items, BATCH_MAX_SIZE);
 
 		if (batch_size == 0) {
 			for (int spin = 0; spin < 2000; spin++) {
@@ -296,9 +313,7 @@ void* simple_inference_reader(void* arg) {
 			while (batch_size < target && wait_rounds < 1000) {
 				usleep(100);
 				int more = collect_ready_slots(g_inference_ring_buf,
-				                               &batch_slots[batch_size],
-				                               &batch_record_idx[batch_size],
-				                               &batch_texts[batch_size],
+				                               &h_items[batch_size],
 				                               target - batch_size);
 				if (more > 0) batch_size += more;
 				wait_rounds++;
@@ -321,9 +336,7 @@ void* simple_inference_reader(void* arg) {
 						__asm__ __volatile__("pause" ::: "memory");
 
 				int more = collect_ready_slots(g_inference_ring_buf,
-				                               &batch_slots[batch_size],
-				                               &batch_record_idx[batch_size],
-				                               &batch_texts[batch_size],
+				                               &h_items[batch_size],
 				                               BATCH_MAX_SIZE - batch_size);
 					if (more == 0)
 						break;
@@ -346,22 +359,83 @@ void* simple_inference_reader(void* arg) {
 			&g_inference_ring_buf->pending_count, __ATOMIC_ACQUIRE);
 
 		if (tensorrt_model != NULL) {
-			clock_gettime(CLOCK_MONOTONIC, &start_time);
-
 			uint64_t t4 = get_timestamp_ns();
 			for (int i = 0; i < batch_size; i++)
-				g_inference_ring_buf->slots[batch_slots[i]].t4_tensorrt_start = t4;
+				g_inference_ring_buf->slots[h_items[i].slot_index].t4_tensorrt_start = t4;
 
-			batch_tokenize_and_infer(tensorrt_model, batch_texts, batch_size,
-			                          batch_embeddings, batch_token_counts);
+			/*
+			 * Tokenize, infer and format entirely on the GPU. Returns after
+			 * the format kernel has completed, which is the ordering point we
+			 * need before publishing RESULT_READY.
+			 */
+			long elapsed_us = 0;
+			int infer_rc = batch_infer_device_resident(tensorrt_model,
+			                                           g_inference_ring_buf,
+			                                           plane, d_items,
+			                                           batch_size, &elapsed_us);
 
 			uint64_t t5 = get_timestamp_ns();
 			for (int i = 0; i < batch_size; i++)
-				g_inference_ring_buf->slots[batch_slots[i]].t5_tensorrt_end = t5;
+				g_inference_ring_buf->slots[h_items[i].slot_index].t5_tensorrt_end = t5;
 
-			clock_gettime(CLOCK_MONOTONIC, &end_time);
-			long elapsed_us = (end_time.tv_sec - start_time.tv_sec) * 1000000 +
-			                  (end_time.tv_nsec - start_time.tv_nsec) / 1000;
+			if (infer_rc != GAZSI_INFER_OK) {
+				/*
+				 * Two very different failures share this branch.
+				 *
+				 * A batch-level failure is answered explicitly: the
+				 * error body is written by a GPU kernel, so the CPU
+				 * still never touches a payload byte, and dropping
+				 * the slot instead would leave the client hanging
+				 * until it times out.
+				 *
+				 * A fatal failure means CUDA, TensorRT, device
+				 * residency, tensor binding or the CUDA graph is
+				 * broken. None of those heal by themselves, so
+				 * emitting an error body would just turn a dead
+				 * server into one that answers every request with
+				 * "inference_failed" while still looking alive. Stop
+				 * serving and let the app tear down.
+				 */
+				int fatal = gazsi_infer_is_fatal(infer_rc);
+
+				if (fatal)
+					DOCA_LOG_ERR("[ADAPTIVE] FATAL: inference pipeline unusable (rc=%d), stopping the server",
+					             infer_rc);
+				else
+					DOCA_LOG_WARN("[ADAPTIVE] device-resident inference failed, emitting error for %d records",
+					              batch_size);
+
+				int emitted = !fatal &&
+					      (gazsi_launch_static_response(g_inference_ring_buf, plane,
+									    d_items, batch_size,
+									    "inference_failed", NULL) == 0 &&
+					       cudaStreamSynchronize(0) == cudaSuccess);
+
+				for (int i = 0; i < batch_size; i++) {
+					if (i + 1 < batch_size &&
+					    h_items[i + 1].slot_index == h_items[i].slot_index)
+						continue;
+					uint32_t slot_idx = h_items[i].slot_index;
+					if (emitted) {
+						publish_inference_result(g_inference_ring_buf, slot_idx);
+					} else {
+						/*
+						 * Fatal, or could not even format an error body.
+						 * Release the slot so the bounded ring does not
+						 * leak and TCP backpressure stays accurate.
+						 */
+						__atomic_store_n(&g_inference_ring_buf->slots[slot_idx].ready,
+								 UVM_STATUS_FREE, __ATOMIC_RELEASE);
+						cpu_iq_push(&g_inference_ring_buf->free_pool, (int)slot_idx);
+					}
+				}
+
+				if (fatal) {
+					DOCA_GPUNETIO_VOLATILE(force_quit) = true;
+					break;
+				}
+				continue;
+			}
 
 			uint32_t pending_after = __atomic_load_n(
 				&g_inference_ring_buf->pending_count, __ATOMIC_ACQUIRE);
@@ -421,7 +495,7 @@ void* simple_inference_reader(void* arg) {
 				static uint64_t prof_count = 0;
 				uint64_t t6_now = get_timestamp_ns();
 				for (int i = 0; i < batch_size; i++) {
-					struct inference_ring_slot *s = &g_inference_ring_buf->slots[batch_slots[i]];
+					struct inference_ring_slot *s = &g_inference_ring_buf->slots[h_items[i].slot_index];
 					uint64_t dt34 = t4 - s->t3_cpu_read;
 					uint64_t dt45 = t5 - t4;
 					uint64_t dt56 = t6_now - t5;
@@ -463,40 +537,47 @@ void* simple_inference_reader(void* arg) {
 			              batch_size, elapsed_us, (float)elapsed_us / batch_size,
 			              n_arrived, lambda_now * 1e6);
 
+			/*
+			 * Response bytes are already in the device payload plane, written
+			 * by the format kernel, and batch_infer_device_resident has
+			 * synchronised. Publishing is a control-plane state change only:
+			 * one release-store and one queue push per slot.
+			 */
+			uint64_t t6 = get_timestamp_ns();
 			for (int i = 0; i < batch_size; i++) {
-				uint32_t slot_idx = batch_slots[i];
-				uint32_t rec = batch_record_idx[i];
-				float *emb = &batch_embeddings[i * MAX_EMBEDDING_DIM];
-				int tokens = batch_token_counts[i];
-				struct inference_ring_slot *s = &g_inference_ring_buf->slots[slot_idx];
+				uint32_t slot_idx = h_items[i].slot_index;
 
-				int rlen = snprintf(result_buffer, sizeof(result_buffer),
-					"{\"input\":\"%s\",\"tokens\":%d,\"embedding_sample\":[%.6f,%.6f,%.6f],\"inference_time_us\":%ld,\"batch_size\":%d}",
-					batch_texts[i], tokens,
-					emb[0], emb[1], emb[2],
-					elapsed_us, batch_size);
+				/* Publish once per slot, after its last record */
+				if (i + 1 < batch_size && h_items[i + 1].slot_index == slot_idx)
+					continue;
 
-				uint32_t off = s->directory[rec].offset;
-				uint32_t max_len = sizeof(s->data) - off - 1;
-				if ((uint32_t)rlen > max_len) rlen = max_len;
-				memcpy(s->data + off, result_buffer, rlen);
-				s->data[off + rlen] = '\0';
-				s->directory[rec].length = rlen;
-
-				bool is_last_record = (i + 1 >= batch_size || batch_slots[i + 1] != slot_idx);
-				if (is_last_record) {
-					s->len = off + rlen;
-					s->t6_cpu_wrote_uvm = get_timestamp_ns();
-					__atomic_store_n(&s->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
-					cpu_iq_push(&g_inference_ring_buf->response_queue, (int)slot_idx);
-				}
+				g_inference_ring_buf->slots[slot_idx].t6_cpu_wrote_uvm = t6;
+				publish_inference_result(g_inference_ring_buf, slot_idx);
 			}
 		} else {
-			DOCA_LOG_WARN("[ADAPTIVE] TensorRT not loaded, fallback");
-			for (int i = 0; i < batch_size; i++) {
-				snprintf(result_buffer, sizeof(result_buffer),
-					"{\"input\":\"%.900s\",\"status\":\"no_model\"}", batch_texts[i]);
-				cpu_write_inference_result_to_gpu_ring(g_inference_ring_buf, batch_slots[i], result_buffer);
+			/*
+			 * No engine loaded. Even here the status body is written by a GPU
+			 * kernel, so the CPU still never touches a payload byte.
+			 */
+			DOCA_LOG_WARN("[ADAPTIVE] TensorRT not loaded, emitting device-side status body");
+			if (gazsi_launch_static_response(g_inference_ring_buf, plane, d_items,
+			                                 batch_size, "no_model", NULL) == 0 &&
+			    cudaStreamSynchronize(0) == cudaSuccess) {
+				for (int i = 0; i < batch_size; i++) {
+					uint32_t slot_idx = h_items[i].slot_index;
+					if (i + 1 < batch_size && h_items[i + 1].slot_index == slot_idx)
+						continue;
+					publish_inference_result(g_inference_ring_buf, slot_idx);
+				}
+			} else {
+				for (int i = 0; i < batch_size; i++) {
+					uint32_t slot_idx = h_items[i].slot_index;
+					if (i + 1 < batch_size && h_items[i + 1].slot_index == slot_idx)
+						continue;
+					__atomic_store_n(&g_inference_ring_buf->slots[slot_idx].ready,
+					                 UVM_STATUS_FREE, __ATOMIC_RELEASE);
+					cpu_iq_push(&g_inference_ring_buf->free_pool, (int)slot_idx);
+				}
 			}
 		}
 	}
@@ -511,6 +592,7 @@ void* simple_inference_reader(void* arg) {
 	}
 
 	DOCA_LOG_INFO("[ADAPTIVE] Thread %d stopped", thread_id);
+	cudaFreeHost(h_items);
 	return NULL;
 }
 
@@ -752,10 +834,10 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	/* Initialize TensorRT on GPU 0 (separate from DOCA kernels on GPU 1) */
-	cudaSetDevice(0);
-	DOCA_LOG_INFO("Using GPU 0 for TensorRT model");
-	if (init_tensorrt_gpu_buffers(0) != 0) {
+	/* Run TensorRT on the same CUDA device selected for GPUNetIO. */
+	cudaSetDevice(cuda_id);
+	DOCA_LOG_INFO("Using CUDA device %d for GPUNetIO and TensorRT", cuda_id);
+	if (init_tensorrt_gpu_buffers(cuda_id) != 0) {
 		DOCA_LOG_ERR("Failed to initialize TensorRT GPU buffers");
 		return EXIT_FAILURE;
 	}
@@ -768,7 +850,7 @@ int main(int argc, char **argv)
 	DOCA_LOG_INFO("Loading TensorRT engine: %s", engine_path);
 	tensorrt_model = load_tensorrt_engine(engine_path);
 	if (tensorrt_model) {
-		DOCA_LOG_INFO("TensorRT model loaded (GPU 0)");
+		DOCA_LOG_INFO("TensorRT model loaded on CUDA device %d", cuda_id);
 
 		/* Warmup TensorRT to eliminate cold start latency */
 		DOCA_LOG_INFO("[WARMUP] Warming up TensorRT contexts...");
@@ -805,18 +887,18 @@ int main(int argc, char **argv)
 		}
 		DOCA_LOG_INFO("[WARMUP] All %d contexts warmed up (%d total inferences)", NUM_INFERENCE_THREADS, NUM_INFERENCE_THREADS * WARMUP_ITERATIONS);
 
-		if (init_cuda_graphs(tensorrt_model) == 0) {
-			DOCA_LOG_INFO("CUDA Graphs initialized for batch sizes 1-8");
+		if (init_cuda_graphs_device_resident(tensorrt_model) == 0) {
+			DOCA_LOG_INFO("Device-resident CUDA Graphs initialized for batch sizes 1-8");
 		} else {
-			DOCA_LOG_WARN("CUDA Graph init failed, using legacy enqueueV3 path");
+			DOCA_LOG_WARN("CUDA Graph init failed, using enqueueV3 path");
 		}
 	} else {
 		DOCA_LOG_WARN("TensorRT model loading failed, inference will be skipped");
 	}
 
-	/* Switch back to DOCA GPU */
+	/* Keep the selected single-GPU context active for GPUNetIO. */
 	cudaSetDevice(cuda_id);
-	DOCA_LOG_INFO("Switching back to GPU %d for DOCA initialization", cuda_id);
+	DOCA_LOG_INFO("Keeping CUDA device %d active for DOCA initialization", cuda_id);
 
 
 	df_port = init_doca_flow(dpdk_dev_port_id, app_cfg.queue_num);
@@ -916,10 +998,26 @@ int main(int argc, char **argv)
 		}
 		tcp_queues.ring = g_inference_ring_buf;
 
-		/* Set GPU-side UVM buffer pointer */
+		/* Set GPU-side control plane pointer */
 		result = set_inference_ring_buffer_kernel(tx_http_server, g_inference_ring_buf);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to set UVM buffer in GPU: %s", doca_error_get_descr(result));
+			return EXIT_FAILURE;
+		}
+
+		/*
+		 * Publish the device payload plane to the RX and TX kernels. Must
+		 * happen before the serving kernels launch: RX skips inference
+		 * entirely while this pointer is null.
+		 */
+		struct inference_payload_plane *payload_plane = get_payload_plane_device();
+		if (payload_plane == NULL) {
+			DOCA_LOG_ERR("Device payload plane was not allocated");
+			return EXIT_FAILURE;
+		}
+		result = set_payload_plane_kernel(tx_http_server, payload_plane);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to set payload plane in GPU: %s", doca_error_get_descr(result));
 			return EXIT_FAILURE;
 		}
 

@@ -75,48 +75,19 @@ __device__ int gpu_iq_pop(struct index_queue *q)
     return (int)val;
 }
 
-/*
- * CPU push: __atomic FAA(tail), then store value.
- */
-void cpu_iq_push(struct index_queue *q, int value)
-{
-    uint32_t pos = __atomic_fetch_add((uint32_t *)&q->tail, 1, __ATOMIC_RELAXED) & IQ_MASK;
-    /* Spin until slot is consumed */
-    while (__atomic_load_n((int32_t *)&q->entries[pos], __ATOMIC_ACQUIRE) != IQ_EMPTY)
-        ;
-    __atomic_store_n((int32_t *)&q->entries[pos], value, __ATOMIC_RELEASE);
-}
-
-/*
- * CPU pop: CAS-loop on head to safely claim a position.
- * Returns slot index (>= 0) or -1 if empty.
- */
-int cpu_iq_pop(struct index_queue *q)
-{
-    uint32_t h, t;
-    for (;;) {
-        h = __atomic_load_n((uint32_t *)&q->head, __ATOMIC_ACQUIRE);
-        t = __atomic_load_n((uint32_t *)&q->tail, __ATOMIC_ACQUIRE);
-        if (h >= t)
-            return -1;
-        if (__atomic_compare_exchange_n((uint32_t *)&q->head, &h, h + 1,
-                                         false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            break;
-    }
-
-    uint32_t pos = h & IQ_MASK;
-    int32_t val;
-    while ((val = __atomic_load_n((int32_t *)&q->entries[pos], __ATOMIC_ACQUIRE)) == IQ_EMPTY)
-        ;
-    __atomic_store_n((int32_t *)&q->entries[pos], (int32_t)IQ_EMPTY, __ATOMIC_RELEASE);
-    return (int)val;
-}
+/* The CPU-side counterparts are static inline in inference/index_queue.h. */
 
 /* ------------------------------------------------------------------ */
 
-/* Global variables: host and device pointer mapping */
+/* Control plane: host-mapped, one allocation aliased by host and device pointers */
 static struct inference_ring_buffer *g_ring_host = NULL;
 static struct inference_ring_buffer *g_ring_device = NULL;
+
+/*
+ * Data plane: device-only. There is no host alias on purpose — payload bytes
+ * must never be reachable from CPU code.
+ */
+static struct inference_payload_plane *g_payload_device = NULL;
 
 /* Semaphore handle for CPU to GPU notification */
 static struct doca_gpu_semaphore *g_sem_inference_cpu = NULL;
@@ -175,12 +146,34 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
         return NULL;
     }
 
-    /* Initialize slots */
+    /*
+     * Device-resident payload arena. cudaMalloc (not cudaHostAlloc) is the
+     * whole point: these bytes are never mapped into the host address space,
+     * so no CPU path can read, tokenize, format or copy them.
+     */
+    if (cudaMalloc(&g_payload_device, sizeof(*g_payload_device)) != cudaSuccess) {
+        fprintf(stderr, "[RING] Failed to allocate %zu B device payload plane\n",
+                sizeof(*g_payload_device));
+        cudaFreeHost(g_ring_host);
+        g_ring_host = NULL;
+        return NULL;
+    }
+    if (cudaMemset(g_payload_device, 0, sizeof(*g_payload_device)) != cudaSuccess) {
+        cudaFree(g_payload_device);
+        cudaFreeHost(g_ring_host);
+        g_payload_device = NULL;
+        g_ring_host = NULL;
+        return NULL;
+    }
+    fprintf(stderr, "[RING] Device payload plane: %zu B at %p (control plane %zu B)\n",
+            sizeof(*g_payload_device), (void *)g_payload_device, sizeof(*g_ring_host));
+
+    /* Initialize control slots (metadata only — payload lives on the device) */
     for (int i = 0; i < INFERENCE_RING_SIZE; i++) {
         g_ring_host->slots[i].len = 0;
         g_ring_host->slots[i].ready = UVM_STATUS_FREE;
         g_ring_host->slots[i].request_id = 0;
-        memset(g_ring_host->slots[i].data, 0, sizeof(g_ring_host->slots[i].data));
+        g_ring_host->slots[i].record_count = 0;
     }
 
     g_ring_host->head = 0;
@@ -253,6 +246,10 @@ struct inference_ring_buffer* init_inference_ring_buffer(int gpu_id)
 
 void free_inference_ring_buffer(struct inference_ring_buffer *ring)
 {
+    if (g_payload_device) {
+        cudaFree(g_payload_device);
+        g_payload_device = NULL;
+    }
     if (g_ring_host) {
         cudaFreeHost(g_ring_host);
         g_ring_host = NULL;
@@ -260,6 +257,11 @@ void free_inference_ring_buffer(struct inference_ring_buffer *ring)
     }
     g_sem_inference_cpu = NULL;
     g_sem_request_cpu = NULL;
+}
+
+struct inference_payload_plane *get_payload_plane_device(void)
+{
+    return g_payload_device;
 }
 
 /* Set inference result notification semaphore (called after semaphore creation) */
@@ -280,30 +282,21 @@ struct doca_gpu_semaphore* get_request_semaphore_cpu(void)
     return g_sem_request_cpu;
 }
 
-/* CPU write - UVM with explicit CUDA sync for concurrency */
-int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gpu,
-                                            uint32_t slot_index,
-                                            const char *result)
+/*
+ * Hand a slot whose response bytes were already written by a GPU kernel over
+ * to the GPU TX kernel. Control metadata only — no payload byte is touched.
+ *
+ * Ordering contract: the caller must have synchronised the CUDA stream that
+ * ran the format kernel BEFORE calling this. Kernel completion makes the
+ * response bytes visible device-wide; the release-store below then guarantees
+ * TX cannot observe RESULT_READY ahead of those bytes.
+ */
+int publish_inference_result(struct inference_ring_buffer *ring_gpu, uint32_t slot_index)
 {
-    if (slot_index >= INFERENCE_RING_SIZE) {
+    if (slot_index >= INFERENCE_RING_SIZE || !g_ring_host)
         return 0;
-    }
 
     struct inference_ring_slot *slot = &g_ring_host->slots[slot_index];
-
-    uint32_t max_len = sizeof(slot->data) - 1;
-    uint32_t len = (uint32_t)strlen(result);
-    if (len > max_len)
-        len = max_len;
-    memcpy(slot->data, result, len);
-    slot->data[len] = '\0';
-    slot->len = len;
-
-    slot->record_count = 1;
-    slot->directory[0].offset = 0;
-    slot->directory[0].length = len;
-    slot->directory[0].tcp_sent_seq = slot->tcp_sent_seq;
-    slot->directory[0].tcp_recv_ack = slot->tcp_recv_ack;
 
     __atomic_store_n(&slot->ready, UVM_STATUS_RESULT_READY, __ATOMIC_RELEASE);
 
@@ -317,19 +310,6 @@ int cpu_write_inference_result_to_gpu_ring(struct inference_ring_buffer *ring_gp
     }
 
     return 1;
-}
-
-/* Get host-side pointer to slot data (for cudaMemcpyAsync source) */
-const char *get_slot_data_host(uint32_t slot_index)
-{
-    if (slot_index >= INFERENCE_RING_SIZE || !g_ring_host) return NULL;
-    return g_ring_host->slots[slot_index].data;
-}
-
-uint32_t get_slot_len_host(uint32_t slot_index)
-{
-    if (slot_index >= INFERENCE_RING_SIZE || !g_ring_host) return 0;
-    return g_ring_host->slots[slot_index].len;
 }
 
 /* GPU-side function: allocate ring slot via O(1) free_pool pop */
@@ -352,6 +332,7 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
     for (int i = 0; i < MAX_RECORDS_PER_SLOT; i++) {
         slot->directory[i].offset = 0;
         slot->directory[i].length = 0;
+        slot->directory[i].resp_length = 0;
         slot->directory[i].tcp_sent_seq = 0;
         slot->directory[i].tcp_recv_ack = 0;
     }
@@ -359,41 +340,4 @@ __device__ int gpu_alloc_ring_slot(struct inference_ring_buffer *ring, uint64_t 
 
     return index;
 }
-
-__device__ void gpu_store_inference_data_to_slot(struct inference_ring_buffer *ring, int slot_index, const char *data)
-{
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> pending_ref(*(uint32_t*)&ring->pending_count);
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> ready_ref(*(uint32_t*)&ring->slots[slot_index].ready);
-
-    struct inference_ring_slot *slot = &ring->slots[slot_index];
-
-    slot->start_timestamp = clock64();
-
-    uint32_t max_len = sizeof(slot->data) - 1;
-    uint32_t offset = slot->len;
-    uint32_t rec = slot->record_count;
-
-    uint32_t len = 0;
-    while (data[len] != '\0' && (offset + len) < max_len)
-        len++;
-
-    for (uint32_t i = 0; i < len; i++)
-        slot->data[offset + i] = data[i];
-    slot->data[offset + len] = '\0';
-
-    if (rec < MAX_RECORDS_PER_SLOT) {
-        slot->directory[rec].offset = offset;
-        slot->directory[rec].length = len;
-        slot->record_count = rec + 1;
-    }
-    slot->len = offset + len;
-
-    slot->t2_gpu_wrote_uvm = clock64();
-
-    pending_ref.fetch_add(1, cuda::memory_order_release);
-    ready_ref.store(UVM_STATUS_PARAM_READY, cuda::memory_order_release);
-
-    gpu_iq_push(&ring->request_queue, slot_index);
-}
-
 

@@ -51,6 +51,7 @@ app_srcs += files([
 
 # Inference implementation
 app_srcs += files([
+	'inference/gpu_pipeline.cu',
 	'inference/ring_buffer.cu',
 	'inference/tensorrt.cu',
 ])

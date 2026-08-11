@@ -4,7 +4,7 @@ A high-performance GPU-accelerated HTTP server and packet processing framework u
 
 ## Overview
 
-GAZSI enables direct GPU processing of network packets, bypassing the CPU for minimal latency. The system implements:
+GAZSI enables zero-copy processing of network packets directly on the GPU for minimal latency. The system implements:
 
 - **GPU-Direct HTTP Server**: HTTP request/response handling entirely on GPU
 - **TensorRT Inference Integration**: ML inference via lock-free CPU-GPU ring buffer
@@ -12,31 +12,55 @@ GAZSI enables direct GPU processing of network packets, bypassing the CPU for mi
 
 ## Architecture
 
+The current implementation runs GPUNetIO networking and TensorRT inference on
+one physical GPU. They use separate CUDA streams on the same CUDA device; the
+design does not require MIG or another GPU-partitioning mechanism.
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Network Interface                            │
+│                     SmartNIC Rx/Tx Queues                           │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ GPUNetIO direct DMA
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                             GPU Memory                              │
+│                                                                     │
+│  Networking Stream                         Inference Stream          │
+│  ┌─────────────┐  ┌─────────────┐         ┌─────────────┐          │
+│  │ TCP Receive │─►│ HTTP Parser │────────►│ GPU         │          │
+│  │ / Transmit  │  │             │         │ Tokenizer   │          │
+│  └──────┬──────┘  └──────┬──────┘         └──────┬──────┘          │
+│         │                │                       ▼                 │
+│         │     ┌──────────▼─────────────────────────────┐           │
+│         └────►│ Device-Resident Request/Response Ring  │◄────┐     │
+│               └────────────────────────────────────────┘     │     │
+│                                                ┌────────▼───┐ │     │
+│                                                │ TensorRT   │ │     │
+│                                                └────────┬───┘ │     │
+│                                                ┌────────▼─────┴──┐  │
+│                                                │ GPU Formatter   │  │
+│                                                └─────────────────┘  │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ Compact control metadata only
+                               ▼
+                    ┌────────────────────────┐
+                    │ CPU Metadata Dispatcher│
+                    │ Batch Formation/Launch │
+                    └────────────────────────┘
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Network Interface                        │
-│                  (ConnectX-6/7 SmartNIC)                    │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ GPUNetIO
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        GPU Memory                            │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ TCP Receive │─►│ HTTP Parser  │─►│ Response Builder │   │
-│  │   Kernel    │  │   Kernel     │  │     Kernel       │   │
-│  └─────────────┘  └──────────────┘  └──────────────────┘   │
-│         │                                                    │
-│         ▼         Ring Buffer (UVM)                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Inference Request Queue ◄──► CPU TensorRT Runner    │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
+
+Request and response bytes remain in device memory throughout this path. A
+small host-mapped, pinned control structure contains only slot state and record
+descriptors. The CPU uses that metadata to form batches and invoke TensorRT,
+but it does not copy, tokenize, or format request and response data. The
+zero-copy mechanism therefore remains intact while the CPU performs the
+execution control required to launch GPU work.
 
 ## Features
 
 - **Zero-Copy Packet Processing**: Direct NIC-to-GPU data path
-- **Lock-Free Ring Buffer**: Efficient CPU-GPU data exchange (128 slots)
+- **Split-Plane Lock-Free Ring Buffer**: 256 metadata slots with device-only payload storage
 - **Semaphore Signaling**: Event-driven CPU-GPU synchronization
 - **Dynamic Batch Inference**: Up to 8 requests per batch
 - **HTTP/1.1 Support**: GET/POST request handling on GPU
@@ -49,11 +73,11 @@ GAZSI enables direct GPU processing of network packets, bypassing the CPU for mi
 - 8GB+ System Memory
 
 ### Software
-- Ubuntu 20.04/22.04
-- DOCA SDK 2.9+
-- CUDA 12.6+
-- TensorRT 10.4 (last version supporting SM 7.0 / V100)
-- GCC 9+
+- Linux
+- NVIDIA DOCA SDK with GPUNetIO support
+- CUDA Toolkit
+- TensorRT
+- GCC
 
 ## Building
 

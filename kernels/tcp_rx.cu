@@ -10,6 +10,7 @@
 #include <doca_gpunetio_dev_buf.cuh>
 #include <doca_gpunetio_dev_sem.cuh>
 #include <doca_gpunetio_dev_eth_rxq.cuh>
+#include "doca33_compat.cuh"  /* DOCA33-COMPAT: build only */
 
 #include "common.h"
 #include "packets.h"
@@ -19,6 +20,7 @@
 DOCA_LOG_REGISTER(GPUNET::KernelReceiveTcp);
 
 extern __device__ struct inference_ring_buffer *g_inference_ring_buf;
+extern __device__ struct inference_payload_plane *g_payload_plane;
 extern __device__ struct doca_gpu_semaphore_gpu *g_sem_request_gpu;
 
 __device__ int g_enable_packing = 0;
@@ -60,7 +62,11 @@ static __device__ int extract_url_param(const uint8_t *payload, uint32_t payload
 	    payload[15] == '?' && payload[16] == 'd' && payload[17] == '=') {
 		param_start = 18;
 	} else {
-		for (int i = 5; i < (int)payload_len && i < 1024; i++) {
+		/*
+		 * The probe reads i+1 and i+2, so it must stop 2 bytes before the
+		 * end of the payload or it reads past it.
+		 */
+		for (int i = 5; i + 2 < (int)payload_len && i < 1024; i++) {
 			if (payload[i] == '?' && payload[i+1] == 'd' && payload[i+2] == '=') {
 				param_start = i + 3;
 				break;
@@ -431,16 +437,13 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 
 		buf_idx = threadIdx.x;
 		while (buf_idx < rx_pkt_num) {
-			ret = doca_gpu_dev_eth_rxq_get_buf(rxq, rx_buf_idx + buf_idx, &buf_ptr);
-			if (ret != DOCA_SUCCESS) {
-				printf("TCP Error %d doca_gpu_dev_eth_rxq_get_buf block %d thread %d\n", ret, blockIdx.x, threadIdx.x);
-				DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
-				break;
-			}
-
-			ret = doca_gpu_dev_buf_get_addr(buf_ptr, &buf_addr);
-			if (ret != DOCA_SUCCESS) {
-				printf("TCP Error %d doca_gpu_dev_eth_rxq_get_buf block %d thread %d\n", ret, blockIdx.x, threadIdx.x);
+			/*
+			 * DOCA33-COMPAT: 3.3 returns the packet address directly,
+			 * replacing the 2.x get_buf + buf_get_addr pair.
+			 */
+			buf_addr = GAZSI_RXQ_PKT_ADDR(rxq, rx_buf_idx + buf_idx);
+			if (buf_addr == 0) {
+				printf("TCP Error null pkt addr block %d thread %d\n", blockIdx.x, threadIdx.x);
 				DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
 				break;
 			}
@@ -449,7 +452,7 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 
 			bool is_http_get = filter_is_http_get(payload);
 			if (is_http_get) {
-				if (http_server && g_inference_ring_buf != nullptr) {
+				if (http_server && g_inference_ring_buf != nullptr && g_payload_plane != nullptr) {
 					uint16_t ip_total_len = BYTE_SWAP16(hdr->l3_hdr.total_length);
 					uint32_t tcp_hdr_len = (hdr->l4_hdr.dt_off >> 4) * 4;
 					uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_hdr_len;
@@ -466,14 +469,16 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 						int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
 						if (slot_idx >= 0) {
 							struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
+							struct inference_payload_slot *pay = &g_payload_plane->slots[slot_idx];
 							slot->t0_gpu_received = clock64();
 							store_routing_context(slot, hdr);
 							slot->http_page_type = (uint8_t)page_type;
 							slot->len = 0;
 							slot->record_count = 0;
 
+							/* Request bytes land in device memory and stay there */
 							int plen = extract_url_param(payload, payload_len,
-							                             slot->data, 0, sizeof(slot->data) - 1);
+							                             pay->request, 0, GAZSI_REQUEST_BYTES - 1);
 							if (plen > 0) {
 								slot->len = plen;
 								slot->record_count = 1;
@@ -505,7 +510,7 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 			else if (filter_is_http_head(payload))
 				stats_thread.http_head++;
 			else if (filter_is_http_post(payload)) {
-				if (http_server && g_inference_ring_buf != nullptr) {
+				if (http_server && g_inference_ring_buf != nullptr && g_payload_plane != nullptr) {
 					uint16_t ip_total_len = BYTE_SWAP16(hdr->l3_hdr.total_length);
 					uint32_t tcp_hdr_len = (hdr->l4_hdr.dt_off >> 4) * 4;
 					uint32_t payload_len = ip_total_len - sizeof(struct ipv4_hdr) - tcp_hdr_len;
@@ -514,17 +519,19 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 					int slot_idx = gpu_alloc_ring_slot(g_inference_ring_buf, &request_id);
 					if (slot_idx >= 0) {
 						struct inference_ring_slot *slot = &g_inference_ring_buf->slots[slot_idx];
+						struct inference_payload_slot *pay = &g_payload_plane->slots[slot_idx];
 						slot->t0_gpu_received = clock64();
 						store_routing_context(slot, hdr);
 						slot->http_page_type = (uint8_t)HTTP_GET_INFERENCE;
 						slot->len = 0;
 						slot->record_count = 0;
 
+						/* Body bytes land in device memory and stay there */
 						int blen = extract_post_body(payload, payload_len,
-						                             slot->data, 0, sizeof(slot->data) - 1);
+						                             pay->request, 0, GAZSI_REQUEST_BYTES - 1);
 						if (blen == 0 && is_chunked_encoding(payload, payload_len))
 							blen = extract_chunked_body(payload, payload_len,
-							                            slot->data, 0, sizeof(slot->data) - 1);
+							                            pay->request, 0, GAZSI_REQUEST_BYTES - 1);
 						if (blen > 0) {
 							slot->len = blen;
 							slot->record_count = 1;
@@ -568,17 +575,20 @@ __global__ void cuda_kernel_receive_tcp(uint32_t *exit_cond,
 					int base = pending_slots[i];
 					uint32_t base_hash = pending_hashes[i];
 					struct inference_ring_slot *bs = &g_inference_ring_buf->slots[base];
+					struct inference_payload_slot *bp = &g_payload_plane->slots[base];
 					int j = i + 1;
 					while (j < n && pending_hashes[j] == base_hash
 					       && bs->record_count < MAX_RECORDS_PER_SLOT) {
 						struct inference_ring_slot *src = &g_inference_ring_buf->slots[pending_slots[j]];
+						struct inference_payload_slot *sp = &g_payload_plane->slots[pending_slots[j]];
 						uint32_t dst_off = bs->len;
 						uint32_t src_len = src->directory[0].length;
-						if (dst_off + src_len + 1 > sizeof(bs->data))
+						if (dst_off + src_len + 1 > GAZSI_REQUEST_BYTES)
 							break;
+						/* Device-to-device copy inside the payload plane */
 						for (uint32_t k = 0; k < src_len; k++)
-							bs->data[dst_off + k] = src->data[k];
-						bs->data[dst_off + src_len] = '\0';
+							bp->request[dst_off + k] = sp->request[k];
+						bp->request[dst_off + src_len] = '\0';
 						uint32_t rec = bs->record_count;
 						bs->directory[rec].offset = dst_off;
 						bs->directory[rec].length = src_len;

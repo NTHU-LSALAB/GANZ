@@ -5,7 +5,9 @@
 
 #include "tensorrt.h"
 #include "ring_buffer.h"
+#include "gpu_pipeline.h"
 #include <iostream>
+#include <time.h>
 #include <fstream>
 #include <vector>
 #include <memory>
@@ -113,10 +115,16 @@ class Logger : public nvinfer1::ILogger {
 };
 
 /*
- * Tokenization Module
+ * Warmup Tokenization
  *
  * Simple word-based tokenization for MiniLM model
  * Format: [CLS] word1 word2 ... wordN [SEP] [PAD] [PAD] ...
+ *
+ * WARMUP PATH ONLY. Request tokenization happens on the GPU against
+ * device-resident payload (see gazsi_launch_tokenize); this host copy survives
+ * solely to warm the engine on startup literals. Keep the two in step: the
+ * device kernel is a transliteration of this function, and
+ * tests/test_gpu_pipeline.cu asserts they agree byte for byte.
  */
 
 /*
@@ -410,15 +418,20 @@ extern "C" void simple_tokenize_and_infer_with_context(TensorRT_Model_t* model_p
 }
 
 /*
- * Dynamic Batching Implementation
+ * Device-Resident Batch Inference
  *
- * Combines N serial inferences into 1 batch inference
- * Batch of 4: ~5ms vs serial 4 × 4ms = 16ms
+ * Combines N inferences into one batch, with tokenization and result
+ * formatting executed by CUDA kernels on payload that never leaves device
+ * memory. The host contributes exactly three things: kernel launches, the
+ * TensorRT execution trigger, and a wall-clock reading.
+ *
+ * There are deliberately NO pinned host staging buffers for input ids,
+ * attention mask or output embeddings here. Their absence is what guarantees
+ * no request or result payload crosses PCIe.
  */
 
 #define MAX_BATCH_SIZE 8
 
-// Pre-allocated batch buffers to avoid malloc per inference
 struct BatchBuffers {
     // GPU device memory (batch_size × sequence_length)
     void *d_input_ids;
@@ -428,10 +441,11 @@ struct BatchBuffers {
     void *d_pooler_output;
     void *d_position_ids;
 
-    // Pinned host memory
-    int64_t *h_input_ids;
-    int64_t *h_attention_mask;
-    float *h_output;
+    // Token counts produced by the GPU tokenizer, consumed by the GPU formatter
+    int32_t *d_token_counts;
+
+    // Pinned host memory for position_ids only: a scalar control input
+    // (sequence length), not request or result payload.
     int64_t *h_position_ids;
 
     // Dedicated stream
@@ -439,14 +453,14 @@ struct BatchBuffers {
 
     bool initialized;
 
-    // CUDA Graph: pre-captured inference graphs per batch size
-    // graph_exec[bs] captures H2D + enqueueV3 + D2H for batch_size=bs
+    // CUDA Graph: pre-captured TensorRT execution per batch size.
+    // Contains enqueueV3 only — no memcpy nodes, by design.
     cudaGraphExec_t graph_exec[MAX_BATCH_SIZE + 1];
     bool graphs_ready;
 };
 
 static BatchBuffers g_batch_buffers = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                        nullptr, nullptr, nullptr, nullptr, nullptr, false,
+                                        nullptr, nullptr, nullptr, false,
                                         {}, false};
 
 // Initialize Batch Buffers (called once)
@@ -463,20 +477,19 @@ static void init_batch_buffers() {
         cudaMalloc(&g_batch_buffers.d_token_type_ids, input_size) != cudaSuccess ||
         cudaMalloc(&g_batch_buffers.d_output, output_size) != cudaSuccess ||
         cudaMalloc(&g_batch_buffers.d_pooler_output, pooler_size) != cudaSuccess ||
-        cudaMalloc(&g_batch_buffers.d_position_ids, sizeof(int64_t)) != cudaSuccess) {
+        cudaMalloc(&g_batch_buffers.d_position_ids, sizeof(int64_t)) != cudaSuccess ||
+        cudaMalloc(&g_batch_buffers.d_token_counts, MAX_BATCH_SIZE * sizeof(int32_t)) != cudaSuccess) {
         fprintf(stderr, "[BATCH] Failed to allocate GPU buffers\n");
         return;
     }
 
     // Initialize token_type_ids to 0
     cudaMemset(g_batch_buffers.d_token_type_ids, 0, input_size);
+    cudaMemset(g_batch_buffers.d_token_counts, 0, MAX_BATCH_SIZE * sizeof(int32_t));
 
-    // Pinned host memory
-    if (cudaHostAlloc(&g_batch_buffers.h_input_ids, input_size, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&g_batch_buffers.h_attention_mask, input_size, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&g_batch_buffers.h_output, output_size, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&g_batch_buffers.h_position_ids, sizeof(int64_t), cudaHostAllocDefault) != cudaSuccess) {
-        fprintf(stderr, "[BATCH] Failed to allocate pinned memory\n");
+    // Pinned host memory for the position_ids scalar only
+    if (cudaHostAlloc(&g_batch_buffers.h_position_ids, sizeof(int64_t), cudaHostAllocDefault) != cudaSuccess) {
+        fprintf(stderr, "[BATCH] Failed to allocate pinned position_ids\n");
         return;
     }
 
@@ -487,22 +500,63 @@ static void init_batch_buffers() {
     }
 
     g_batch_buffers.initialized = true;
-    fprintf(stderr, "[BATCH] Batch buffers initialized (max_batch=%d)\n", MAX_BATCH_SIZE);
+    fprintf(stderr, "[BATCH] Device-resident batch buffers initialized (max_batch=%d)\n", MAX_BATCH_SIZE);
+}
+
+// Bind engine tensors to the fixed device buffers for a given batch size.
+// Shapes and addresses are CPU-side context state, so this is done outside
+// any graph capture.
+static bool bind_tensors(TensorRT_Context* model, nvinfer1::IExecutionContext* context, int bs) {
+    nvinfer1::Dims input_dims;
+    input_dims.nbDims = 2;
+    input_dims.d[0] = bs;
+    input_dims.d[1] = SEQUENCE_LENGTH;
+
+    if (!context->setInputShape("input_ids", input_dims)) return false;
+    if (!context->setInputShape("attention_mask", input_dims)) return false;
+    if (model->has_token_type_ids) {
+        if (!context->setInputShape("token_type_ids", input_dims)) return false;
+    }
+
+    context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
+    context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
+    if (model->has_token_type_ids) {
+        context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
+    }
+    if (model->has_position_ids) {
+        g_batch_buffers.h_position_ids[0] = (int64_t)SEQUENCE_LENGTH;
+        if (cudaMemcpy(g_batch_buffers.d_position_ids, g_batch_buffers.h_position_ids,
+                       sizeof(int64_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            return false;
+        }
+        context->setTensorAddress(model->position_ids_name.c_str(), g_batch_buffers.d_position_ids);
+    }
+    context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
+    if (model->has_pooler_output && !model->pooler_tensor_name.empty()) {
+        context->setTensorAddress(model->pooler_tensor_name.c_str(), g_batch_buffers.d_pooler_output);
+    }
+    return true;
+}
+
+// Floats between consecutive batch elements in the output tensor.
+static inline int output_stride(const TensorRT_Context* model) {
+    return model->output_has_seq_dim
+        ? SEQUENCE_LENGTH * model->embedding_dim
+        : model->embedding_dim;
 }
 
 /*
- * CUDA Graph Capture for Batch Inference
+ * CUDA Graph Capture for Device-Resident Batch Inference
  *
- * Pre-captures the TensorRT inference pipeline (H2D + enqueueV3 + D2H) as
- * CUDA Graphs, one per batch size (1 to MAX_BATCH_SIZE). This eliminates
- * per-inference CPU overhead from setInputShape, setTensorAddress, and the
- * ~50-100 internal kernel launches inside enqueueV3, replacing them with a
- * single cudaGraphLaunch call (~4 µs).
+ * Captures TensorRT execution only, one graph per batch size. Input tensors
+ * are filled in place by the tokenizer kernel and the output tensor is read in
+ * place by the formatter kernel, both stream-ordered around the graph launch,
+ * so the graph needs no memcpy nodes at all.
  *
- * Prerequisite: init_batch_buffers() must be called first.
- * Buffer addresses are fixed at init time and baked into each graph.
+ * Prerequisite: init_batch_buffers(). Buffer addresses are fixed at init time
+ * and baked into each graph.
  */
-extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
+extern "C" int init_cuda_graphs_device_resident(TensorRT_Model_t* model_ptr) {
     auto* model = static_cast<TensorRT_Context*>(model_ptr);
 
     if (!model || model->contexts.empty() || !model->contexts[0]) {
@@ -510,7 +564,6 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
         return -1;
     }
 
-    // Ensure batch buffers exist
     init_batch_buffers();
     if (!g_batch_buffers.initialized) {
         fprintf(stderr, "[CUDA_GRAPH] Error: batch buffers not initialized\n");
@@ -520,56 +573,26 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
     auto* context = model->contexts[0].get();
     cudaStream_t stream = g_batch_buffers.stream;
 
-    fprintf(stderr, "[CUDA_GRAPH] Capturing inference graphs for batch sizes 1-%d...\n", MAX_BATCH_SIZE);
-
     // Determine max batch from engine profile
     auto max_shape = model->engine->getProfileShape("input_ids", 0, nvinfer1::OptProfileSelector::kMAX);
     int engine_max_batch = (max_shape.nbDims >= 1 && max_shape.d[0] > 0) ? max_shape.d[0] : 1;
     int graph_max_batch = std::min(MAX_BATCH_SIZE, engine_max_batch);
 
-    fprintf(stderr, "[CUDA_GRAPH] Engine max batch=%d, capturing graphs for bs 1-%d\n",
+    fprintf(stderr, "[CUDA_GRAPH] Engine max batch=%d, capturing device-resident graphs for bs 1-%d\n",
             engine_max_batch, graph_max_batch);
 
     for (int bs = 1; bs <= graph_max_batch; bs++) {
-        // 1. Set shapes and addresses OUTSIDE capture (these are CPU-side state)
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = bs;
-        input_dims.d[1] = SEQUENCE_LENGTH;
-
-        context->setInputShape("input_ids", input_dims);
-        context->setInputShape("attention_mask", input_dims);
-        if (model->has_token_type_ids) {
-            context->setInputShape("token_type_ids", input_dims);
+        if (!bind_tensors(model, context, bs)) {
+            fprintf(stderr, "[CUDA_GRAPH] Error: tensor binding failed for bs=%d\n", bs);
+            return -1;
         }
 
-        context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
-        context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
-        if (model->has_token_type_ids) {
-            context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
-        }
-        if (model->has_position_ids) {
-            g_batch_buffers.h_position_ids[0] = (int64_t)SEQUENCE_LENGTH;
-            cudaMemcpy(g_batch_buffers.d_position_ids, g_batch_buffers.h_position_ids,
-                       sizeof(int64_t), cudaMemcpyHostToDevice);
-            context->setTensorAddress(model->position_ids_name.c_str(), g_batch_buffers.d_position_ids);
-        }
-        context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
-        if (model->has_pooler_output && !model->pooler_tensor_name.empty()) {
-            context->setTensorAddress(model->pooler_tensor_name.c_str(), g_batch_buffers.d_pooler_output);
-        }
-
-        // 2. Warm-up run: let TensorRT initialize internal cuBLAS handles etc.
+        // Warm-up run: let TensorRT initialize internal cuBLAS handles etc.
         if (!context->enqueueV3(stream)) {
             fprintf(stderr, "[CUDA_GRAPH] Error: warm-up enqueueV3 failed for bs=%d\n", bs);
             return -1;
         }
         cudaStreamSynchronize(stream);
-
-        size_t input_size = bs * SEQUENCE_LENGTH * sizeof(int64_t);
-        size_t output_size = model->output_has_seq_dim
-            ? bs * SEQUENCE_LENGTH * model->embedding_dim * sizeof(float)
-            : bs * model->embedding_dim * sizeof(float);
 
         cudaGraph_t graph;
         cudaError_t err;
@@ -581,14 +604,8 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
             return -1;
         }
 
-        // These memcpy + enqueue operations are recorded, not executed
-        cudaMemcpyAsync(g_batch_buffers.d_input_ids, g_batch_buffers.h_input_ids,
-                        input_size, cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(g_batch_buffers.d_attention_mask, g_batch_buffers.h_attention_mask,
-                        input_size, cudaMemcpyHostToDevice, stream);
+        // Inference only — inputs and outputs are already where they belong
         context->enqueueV3(stream);
-        cudaMemcpyAsync(g_batch_buffers.h_output, g_batch_buffers.d_output,
-                        output_size, cudaMemcpyDeviceToHost, stream);
 
         err = cudaStreamEndCapture(stream, &graph);
         if (err != cudaSuccess) {
@@ -597,7 +614,6 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
             return -1;
         }
 
-        // 4. Instantiate executable graph
         err = cudaGraphInstantiate(&g_batch_buffers.graph_exec[bs], graph, NULL, NULL, 0);
         cudaGraphDestroy(graph);  // Original graph no longer needed
         if (err != cudaSuccess) {
@@ -606,154 +622,166 @@ extern "C" int init_cuda_graphs(TensorRT_Model_t* model_ptr) {
             return -1;
         }
 
-        fprintf(stderr, "[CUDA_GRAPH] Captured graph for batch_size=%d (input=%zu, output=%zu bytes)\n",
-                bs, input_size, output_size);
+        fprintf(stderr, "[CUDA_GRAPH] Captured inference-only graph for batch_size=%d\n", bs);
     }
 
     g_batch_buffers.graphs_ready = true;
-    fprintf(stderr, "[CUDA_GRAPH] All %d graphs captured successfully\n", graph_max_batch);
+    fprintf(stderr, "[CUDA_GRAPH] All %d device-resident graphs captured successfully\n", graph_max_batch);
     return 0;
 }
 
-// Batch Tokenization: Convert N texts to batch tensor (CPU path, kept as fallback)
-static void batch_tokenize(const char** texts, int batch_size,
-                            int64_t* batch_input_ids, int64_t* batch_attention_mask,
-                            int* token_counts) {
-    for (int b = 0; b < batch_size; b++) {
-        int64_t* input_ids = &batch_input_ids[b * SEQUENCE_LENGTH];
-        int64_t* attention_mask = &batch_attention_mask[b * SEQUENCE_LENGTH];
-        token_counts[b] = tokenize_text(texts[b], input_ids, attention_mask);
-    }
+static inline uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-extern "C" void batch_tokenize_and_infer(TensorRT_Model_t* model_ptr, const char** texts, int batch_size,
-                                          float* batch_embeddings, int* token_counts) {
+/*
+ * The device-resident path has one hard requirement the old host path did not:
+ * the tokenizer kernel reads the payload plane and writes the engine's input
+ * tensors, so both must be reachable from one device. When payload staging went
+ * through host memory a cross-device split merely ran slowly; now it would read
+ * an address that is not mapped on the executing device.
+ *
+ * Checked once and reported loudly rather than left to corrupt silently.
+ */
+static bool check_same_device(const struct inference_payload_plane *plane) {
+    static int verdict = -1;
+    if (verdict >= 0)
+        return verdict == 1;
+
+    cudaPointerAttributes pa, ta;
+    if (cudaPointerGetAttributes(&pa, (const void *)plane) != cudaSuccess ||
+        cudaPointerGetAttributes(&ta, g_batch_buffers.d_input_ids) != cudaSuccess) {
+        fprintf(stderr, "[BATCH] Error: cannot query device residency of payload/tensors\n");
+        verdict = 0;
+        return false;
+    }
+
+    if (pa.device != ta.device) {
+        fprintf(stderr,
+                "[BATCH] FATAL: payload plane is on CUDA device %d but TensorRT input "
+                "tensors are on device %d. The device-resident path needs both on one "
+                "device; run DOCA and TensorRT on the same GPU.\n",
+                pa.device, ta.device);
+        verdict = 0;
+        return false;
+    }
+
+    fprintf(stderr, "[BATCH] Payload plane and TensorRT tensors both on CUDA device %d\n",
+            pa.device);
+    verdict = 1;
+    return true;
+}
+
+extern "C" int batch_infer_device_resident(TensorRT_Model_t* model_ptr,
+                                           struct inference_ring_buffer* ring,
+                                           struct inference_payload_plane* plane,
+                                           const struct gazsi_batch_item* d_items,
+                                           int batch_size,
+                                           long* out_elapsed_us) {
     auto* model = static_cast<TensorRT_Context*>(model_ptr);
 
-    // Validate parameters
-    if (!model || !texts || !batch_embeddings || !token_counts) {
-        fprintf(stderr, "[BATCH] Error: Invalid parameters\n");
-        return;
+    /*
+     * A null plane/ring/model is a wiring mistake, not a bad request: it is
+     * identical on every subsequent batch, so it is fatal. Only batch_size is
+     * per-batch data and therefore recoverable.
+     */
+    if (!model || !ring || !plane || !d_items || !out_elapsed_us) {
+        fprintf(stderr, "[BATCH] FATAL: Invalid parameters\n");
+        return GAZSI_INFER_ERR_FATAL;
     }
-
     if (batch_size < 1 || batch_size > MAX_BATCH_SIZE) {
         fprintf(stderr, "[BATCH] Error: Invalid batch_size %d (must be 1-%d)\n", batch_size, MAX_BATCH_SIZE);
-        return;
+        return GAZSI_INFER_ERR_BATCH;
     }
 
-    // Ensure batch buffers are initialized
     init_batch_buffers();
     if (!g_batch_buffers.initialized) {
-        fprintf(stderr, "[BATCH] Error: Batch buffers not initialized\n");
-        return;
+        fprintf(stderr, "[BATCH] FATAL: Batch buffers not initialized (CUDA allocation)\n");
+        return GAZSI_INFER_ERR_FATAL;
     }
-
-    // Use context 0 for inference
     if (model->contexts.empty() || !model->contexts[0]) {
-        fprintf(stderr, "[BATCH] Error: Context 0 not available\n");
-        return;
+        fprintf(stderr, "[BATCH] FATAL: Context 0 not available\n");
+        return GAZSI_INFER_ERR_FATAL;
     }
+    if (!check_same_device(plane))
+        return GAZSI_INFER_ERR_FATAL;
 
     try {
         auto* context = model->contexts[0].get();
         cudaStream_t stream = g_batch_buffers.stream;
 
-        // 1. Batch Tokenization → pinned memory (CPU work, not in graph)
-        batch_tokenize(texts, batch_size,
-                       g_batch_buffers.h_input_ids, g_batch_buffers.h_attention_mask,
-                       token_counts);
+        uint64_t t_start = monotonic_ns();
 
-        static cudaEvent_t ev_infer_start = nullptr, ev_infer_end = nullptr;
-        static double sum_gpu_infer_ms = 0;
-        static uint64_t gpu_infer_count = 0;
-        if (!ev_infer_start) {
-            cudaEventCreate(&ev_infer_start);
-            cudaEventCreate(&ev_infer_end);
+        /* 1. Tokenize device-resident request bytes straight into the engine inputs */
+        if (gazsi_launch_tokenize(plane, d_items, batch_size,
+                                  g_batch_buffers.d_input_ids,
+                                  g_batch_buffers.d_attention_mask,
+                                  g_batch_buffers.d_token_counts,
+                                  SEQUENCE_LENGTH, stream) != 0) {
+            fprintf(stderr, "[BATCH] FATAL: tokenizer launch failed\n");
+            return GAZSI_INFER_ERR_FATAL;
         }
 
-        if (g_batch_buffers.graphs_ready && batch_size >= 1 && batch_size <= MAX_BATCH_SIZE) {
-            cudaEventRecord(ev_infer_start, stream);
+        /*
+         * 2. Trigger TensorRT execution.
+         *
+         * This host call is the one unavoidable control-plane crossing:
+         * TensorRT has no device-side execution API, so a persistent GPU
+         * kernel cannot start an inference. Only the trigger is on the host —
+         * every tensor involved stays in device memory.
+         */
+        if (g_batch_buffers.graphs_ready && g_batch_buffers.graph_exec[batch_size]) {
             CUDA_CHECK(cudaGraphLaunch(g_batch_buffers.graph_exec[batch_size], stream));
-            cudaEventRecord(ev_infer_end, stream);
         } else {
-            /* Legacy path: fallback if graphs not captured */
-            size_t input_size = batch_size * SEQUENCE_LENGTH * sizeof(int64_t);
-            size_t output_size = model->output_has_seq_dim
-                ? batch_size * SEQUENCE_LENGTH * model->embedding_dim * sizeof(float)
-                : batch_size * model->embedding_dim * sizeof(float);
-
-            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_input_ids, g_batch_buffers.h_input_ids,
-                                        input_size, cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_attention_mask, g_batch_buffers.h_attention_mask,
-                                        input_size, cudaMemcpyHostToDevice, stream));
-
-            nvinfer1::Dims input_dims;
-            input_dims.nbDims = 2;
-            input_dims.d[0] = batch_size;
-            input_dims.d[1] = SEQUENCE_LENGTH;
-
-            context->setInputShape("input_ids", input_dims);
-            context->setInputShape("attention_mask", input_dims);
-            if (model->has_token_type_ids) {
-                context->setInputShape("token_type_ids", input_dims);
+            if (!bind_tensors(model, context, batch_size)) {
+                fprintf(stderr, "[BATCH] FATAL: tensor binding failed\n");
+                return GAZSI_INFER_ERR_FATAL;
             }
-
-            context->setTensorAddress("input_ids", g_batch_buffers.d_input_ids);
-            context->setTensorAddress("attention_mask", g_batch_buffers.d_attention_mask);
-            if (model->has_token_type_ids) {
-                context->setTensorAddress("token_type_ids", g_batch_buffers.d_token_type_ids);
-            }
-            if (model->has_position_ids) {
-                g_batch_buffers.h_position_ids[0] = (int64_t)SEQUENCE_LENGTH;
-                CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.d_position_ids, g_batch_buffers.h_position_ids,
-                                            sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-                context->setTensorAddress(model->position_ids_name.c_str(), g_batch_buffers.d_position_ids);
-            }
-            context->setTensorAddress(model->output_tensor_name.c_str(), g_batch_buffers.d_output);
-            if (model->has_pooler_output && !model->pooler_tensor_name.empty()) {
-                context->setTensorAddress(model->pooler_tensor_name.c_str(), g_batch_buffers.d_pooler_output);
-            }
-
             if (!context->enqueueV3(stream)) {
-                fprintf(stderr, "[BATCH] Error: enqueueV3 failed\n");
-                return;
+                fprintf(stderr, "[BATCH] FATAL: enqueueV3 failed\n");
+                return GAZSI_INFER_ERR_FATAL;
             }
-
-            CUDA_CHECK(cudaMemcpyAsync(g_batch_buffers.h_output, g_batch_buffers.d_output,
-                                        output_size, cudaMemcpyDeviceToHost, stream));
         }
 
+        /*
+         * 3. Sync: makes the output tensor visible device-wide before the
+         *    formatter reads it, and pins down the inference time that goes
+         *    into the response body.
+         */
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        {
-            float gpu_ms = 0;
-            cudaEventElapsedTime(&gpu_ms, ev_infer_start, ev_infer_end);
-            sum_gpu_infer_ms += gpu_ms;
-            gpu_infer_count++;
-            if (gpu_infer_count > 0 && gpu_infer_count % 2000 == 0) {
-                fprintf(stderr, "[GPU_INFER] window=%lu avg=%.3fms/batch batch_items=%d\n",
-                    (unsigned long)gpu_infer_count, sum_gpu_infer_ms / gpu_infer_count, batch_size);
-                sum_gpu_infer_ms = 0;
-                gpu_infer_count = 0;
-            }
+        long elapsed_us = (long)((monotonic_ns() - t_start) / 1000ULL);
+
+        /* 4. Format the response bytes in place, in device memory */
+        if (gazsi_launch_format_results(ring, plane, d_items, batch_size,
+                                       (const float *)g_batch_buffers.d_output,
+                                       g_batch_buffers.d_token_counts,
+                                       model->embedding_dim,
+                                       output_stride(model),
+                                       elapsed_us, stream) != 0) {
+            fprintf(stderr, "[BATCH] FATAL: result formatter launch failed\n");
+            return GAZSI_INFER_ERR_FATAL;
         }
 
-        int edim = model->embedding_dim;
-        int stride = model->output_has_seq_dim ? SEQUENCE_LENGTH * edim : edim;
-        for (int b = 0; b < batch_size; b++) {
-            float* src = &g_batch_buffers.h_output[b * stride];
-            float* dst = &batch_embeddings[b * edim];
-            memcpy(dst, src, edim * sizeof(float));
-        }
+        /*
+         * 5. Sync before returning. The caller publishes RESULT_READY next,
+         *    and the response bytes must be visible device-wide before the TX
+         *    kernel can observe that state change.
+         */
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        *out_elapsed_us = elapsed_us;
+        return GAZSI_INFER_OK;
 
     } catch (const std::exception& e) {
-        fprintf(stderr, "[BATCH] Exception: %s\n", e.what());
-        int edim = model->embedding_dim;
-        for (int b = 0; b < batch_size; b++) {
-            token_counts[b] = 0;
-            memset(&batch_embeddings[b * edim], 0, edim * sizeof(float));
-        }
+        /*
+         * The only throw sites reachable from here are CUDA_CHECK (graph
+         * launch, stream sync) and TensorRT itself. Both leave the context in
+         * a state the next batch cannot recover from.
+         */
+        fprintf(stderr, "[BATCH] FATAL: Exception: %s\n", e.what());
+        return GAZSI_INFER_ERR_FATAL;
     }
 }
-
-

@@ -8,6 +8,7 @@
 #include <rte_ethdev.h>
 
 #include "common.h"
+#include "doca33_compat.h"
 #include "tcp/session.h"
 #include "tcp/cpu_rss.h"
 
