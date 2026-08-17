@@ -15,7 +15,9 @@ build/
 # Data directories (not source code)
 # -----------------------------------------------------------------------------
 models/
-baseline/
+baseline/*
+!baseline/README.md
+!baseline/baseline_trt.cpp
 benchmark_results/
 docs/
 tools/

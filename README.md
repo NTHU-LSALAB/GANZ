@@ -94,6 +94,29 @@ sudo meson build -Denable_GAZSI=true
 sudo ninja -C build
 ```
 
+## Kernel TCP Baseline
+
+The host-mediated comparison used in the paper is published in
+[`baseline/baseline_trt.cpp`](baseline/baseline_trt.cpp). It uses the Linux
+kernel TCP stack and a nonblocking epoll server while retaining the following
+GPU-side optimizations:
+
+- pinned host input and output buffers;
+- asynchronous H2D and D2H copies;
+- a nonblocking CUDA stream;
+- TensorRT with batch size one; and
+- an optional captured batch-one CUDA Graph enabled with `-O`.
+
+Request parsing, the workload-specific hash transformation, and response
+formatting remain on the CPU. See [`baseline/README.md`](baseline/README.md) for
+build and run commands. The VMA/XLIO experiment uses this same executable with
+the kernel-bypass library preloaded, so it remains a separate control rather
+than part of the kernel TCP configuration.
+
+`tests/ab_perf.sh` is a source-tree regression check. It no longer assumes an
+author-specific directory: pass the comparison checkout with `--base` or set
+`GAZSI_BASE_DIR`.
+
 ## Usage
 
 ```bash

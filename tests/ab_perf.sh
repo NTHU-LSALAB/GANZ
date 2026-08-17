@@ -42,7 +42,7 @@
 # Options:
 #   --engine <path>    TensorRT engine        (default ../models/bert_base.engine)
 #   --new    <dir>     this branch            (default the parent of this script)
-#   --base   <dir>     baseline tree          (default /home/dpu/aiden/GAZSI)
+#   --base   <dir>     comparison source tree (or set GAZSI_BASE_DIR)
 #   --ip     <addr>    server IP              (default 10.0.0.6)
 #   --port   <port>    server port            (default 8089)
 #   --netns  <ns>      client namespace       (default test_ns)
@@ -55,7 +55,7 @@ set -uo pipefail
 GPU_PCI=""; NIC_PCI=""
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEW_DIR="$(dirname "$HERE")"
-BASE_DIR="/home/dpu/aiden/GAZSI"
+BASE_DIR="${GAZSI_BASE_DIR:-}"
 ENGINE="$NEW_DIR/models/bert_base.engine"
 SRV_IP="10.0.0.6"; SRV_PORT="8089"; NETNS="test_ns"
 REPS=3; SECS=30; OUTDIR="./ab_results"
@@ -81,6 +81,11 @@ done
 
 if [ -z "$GPU_PCI" ] || [ -z "$NIC_PCI" ]; then
     echo "ERROR: --gpu and --nic are required" >&2
+    exit 2
+fi
+
+if [ -z "$BASE_DIR" ]; then
+    echo "ERROR: --base <comparison-tree> or GAZSI_BASE_DIR is required" >&2
     exit 2
 fi
 
