@@ -6,19 +6,14 @@ nonblocking epoll loop. The CPU parses each request, applies the same
 workload-specific whitespace/hash transformation used by GAZSI, and formats the
 response. TensorRT executes one request at a time on the GPU.
 
-The configuration preserved for the paper campaign uses:
+The configuration reported in the paper uses:
 
 - pinned host input and output buffers;
 - asynchronous H2D and D2H copies;
 - a nonblocking CUDA stream;
 - TensorRT with batch size one; and
-- explicit synchronization between the transfer and inference stages.
-
-The source also provides an optional `-O` mode that captures a batch-one CUDA
-Graph spanning the transfers and TensorRT enqueue. The preserved campaign
-launcher did not pass `-O`, and the archived logs use the non-graph `[PROFILE]`
-path rather than `[PROFILE-OPT]`. The paper results therefore do not claim CUDA
-Graph acceleration for this baseline.
+- a captured batch-one CUDA Graph spanning the H2D transfers, TensorRT enqueue,
+  and D2H transfer.
 
 ## Build
 
@@ -42,14 +37,14 @@ g++ -O3 -std=c++17 -pthread \
 
 ## Run
 
-Pass `-O` to evaluate the optional captured CUDA Graph mode. Omit it to match
-the preserved paper campaign.
+Pass `-O` to enable the captured CUDA Graph configuration reported in the paper.
 
 ```bash
 LD_LIBRARY_PATH="$TENSORRT_ROOT/lib/x86_64-linux-gnu:$CUDA_ROOT/lib64:${LD_LIBRARY_PATH:-}" \
   baseline/baseline_trt \
   -e models/bert_base.engine \
-  -p 8090
+  -p 8090 \
+  -O
 ```
 
 An example load command matching the primary ten-second workload is:

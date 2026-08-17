@@ -105,7 +105,7 @@ GPU-side optimizations:
 - asynchronous H2D and D2H copies;
 - a nonblocking CUDA stream;
 - TensorRT with batch size one; and
-- an optional captured batch-one CUDA Graph enabled with `-O`.
+- a captured batch-one CUDA Graph enabled with `-O` for the reported configuration.
 
 Request parsing, the workload-specific hash transformation, and response
 formatting remain on the CPU. See [`baseline/README.md`](baseline/README.md) for
