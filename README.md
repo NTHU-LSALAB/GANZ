@@ -117,6 +117,9 @@ than part of the kernel TCP configuration.
 author-specific directory: pass the comparison checkout with `--base` or set
 `GAZSI_BASE_DIR`.
 
+The platform, workload, run-policy, and measurement details used by the paper
+are collected in [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md).
+
 ## Usage
 
 ```bash
