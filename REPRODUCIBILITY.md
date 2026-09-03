@@ -11,6 +11,9 @@ This document records the experimental settings used for the paper.
 - CUDA Toolkit: 12.5
 - TensorRT: 10.4.0
 - DOCA SDK: 2.9.3008
+- NVIDIA GPU driver: 580.126.20
+- mlx5_core driver: 26.01-1.0.0
+- BlueField-3/ConnectX-7 firmware: 32.43.3608
 
 The client uses ordinary HTTP/1.1 sockets. GAZSI receives traffic through the
 BlueField data path, while the kernel TCP comparison terminates the same request
