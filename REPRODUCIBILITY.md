@@ -31,8 +31,9 @@ queues.
 ## Workloads and measurements
 
 The primary concurrency sweep uses FP16 BERT-base with 1, 2, 4, 8, 16, and 32
-concurrent requests. Each condition runs for 10 seconds. GAZSI and the kernel TCP
-comparison use the same workload-specific whitespace and hash transformation.
+concurrent requests. Each run uses five seconds of warmup followed by 15 seconds
+of measurement, with five independent runs per condition. GAZSI and the kernel
+TCP comparison use the same workload-specific whitespace and hash transformation.
 This transformation is not a general tokenizer.
 
 | Study | Tested conditions | Duration |
@@ -43,17 +44,33 @@ This transformation is not a general tokenizer.
 | Burst | Concurrency changes from 4 to 32 or 64 and returns to 4 | 2 s per phase |
 | Cross-model | FP16 BERT-base, GPT-2, and GPT-2-Large at concurrency 16 | 15 s |
 
-All HTTP load tests use `wrk --latency`. ApacheBench is not used. The primary
-sweep uses one client thread at concurrency 1, two threads at concurrency 2, and
-four threads at higher concurrency. The 15-second payload and dispatch runs use
-up to four client threads.
+GAZSI, Baseline, and VMA use `wrk --latency` for HTTP load tests. ApacheBench is
+not used. The primary sweep uses one client thread at concurrency 1, two at 2, and
+four threads at higher concurrency, with a five-second request timeout. The
+15-second payload and dispatch runs use up to four client threads.
 
-The cross-model comparison uses five independent runs for each model and service
-and reports the arithmetic mean and sample standard deviation. Other figures use
-one recorded run or trace. Response-time percentiles are taken from `wrk`.
+The primary concurrency sweep and cross-model comparison use five independent
+runs per condition and report the arithmetic mean and sample standard deviation.
+The separate Triton reference measurements also use five runs. The shared-GPU
+model-kernel comparison uses three profile comparisons. Other results use one
+recorded run or trace, as identified in the manuscript. Samples within one trace
+are not counted as independent runs.
+
 Response time is measured at the client from request issue until the complete
-response arrives. Burst results report the median of the first five samples in
-each phase.
+response arrives. Response-time percentiles for the HTTP socket measurements
+are taken from `wrk`; the separate Triton measurements use its client tools.
+GAZSI and Baseline burst results report the median of the first five samples in
+each phase of their recorded traces. Triton burst results report the mean and
+sample standard deviation of phase medians from five runs.
+
+## Measurement data
+
+The [evaluation data supplement](data/evaluation/README.md) provides processed
+[observations from individual runs and profile comparisons](data/evaluation/run_measurements.csv)
+and [statistical summaries with 95% confidence intervals](data/evaluation/summary_ci95.csv)
+for the repeated experiments listed there. Its README describes the experiment
+coverage, units, sampling units, and interval calculation. Figure error bars
+retain their stated definition as sample standard deviations.
 
 ## Kernel TCP comparison
 
