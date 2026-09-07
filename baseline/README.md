@@ -58,3 +58,9 @@ DPDK, io_uring, and GPUDirect RDMA are intentionally not enabled in this
 baseline. They define different host-I/O or data-placement boundaries. VMA/XLIO
 is evaluated separately by preloading its userspace library with this same
 server.
+
+## BERT and GPT integration sources
+
+The [model integration source collection](model_support/README.md) contains the
+BERT-base engine preparation script and the GPT-2/GPT-2-Large input, runtime,
+and response-handling sources.
